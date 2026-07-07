@@ -7,7 +7,26 @@ import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 import datetime
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from threading import Thread       # 👈 新增：用於多執行緒
+from flask import Flask            # 👈 新增：輕量網頁伺服器
 
+# ================= 新增：防休眠 Flask 網頁設定 =================
+app = Flask('')
+
+@app.route('/')
+def home():
+    return "🤖 牙材訂購機器人正在雲端穩定運作中！"
+
+def run_web_server():
+    # Render 規定免費網頁專案必須綁定它指定的 PORT (通常是 10000)
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host='0.0.0.0', port=port)
+
+def keep_alive():
+    # 建立一個背景執行緒來跑網頁伺服器，不干擾 Discord 機器人主體
+    t = Thread(target=run_web_server)
+    t.start()
+# =============================================================
 # ================= 0. 全域變數與資料庫連線 =================
 # ================= 1. Google Sheets 連線設定（修改為雲端安全版） =================
 scope = [
@@ -326,4 +345,9 @@ async def force_close_command(interaction: discord.Interaction):
 # ================= 最底部啟動機器人（修改為雲端安全版） =================
 # 💡 改由環境變數讀取 Token
 DISCORD_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
+
+# 💡 在啟動機器人前，先喚醒背景網頁伺服器
+keep_alive()
+
+# 啟動機器人
 bot.run(DISCORD_TOKEN)
