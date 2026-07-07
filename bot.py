@@ -20,7 +20,7 @@ def home():
 def run_web_server():
     # Render 規定免費網頁專案必須綁定它指定的 PORT (通常是 10000)
     port = int(os.environ.get("PORT", 10000))
-    app.run(host='0.0.0.0', port=port)
+    app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
 
 def keep_alive():
     # 建立一個背景執行緒來跑網頁伺服器，不干擾 Discord 機器人主體
@@ -343,11 +343,13 @@ async def force_close_command(interaction: discord.Interaction):
     await auto_close_order()
 
 # ================= 最底部啟動機器人（修改為雲端安全版） =================
-# 💡 改由環境變數讀取 Token
-DISCORD_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
-
-# 💡 在啟動機器人前，先喚醒背景網頁伺服器
-keep_alive()
-
-# 啟動機器人
-bot.run(DISCORD_TOKEN)
+if __name__ == "__main__":
+    DISCORD_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
+    
+    # 1. 💡 第一優先：先讓網頁伺服器跑起來，去應付 Render 的檢查與 UptimeRobot
+    print("🌐 正在啟動 Flask 背景網頁服務...")
+    keep_alive()
+    
+    # 2. 第二優先：接著才去連線 Discord
+    print("🤖 正在連線至 Discord...")
+    bot.run(DISCORD_TOKEN)
