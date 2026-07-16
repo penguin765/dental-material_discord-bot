@@ -1,355 +1,351 @@
 import os
 import json
+import datetime
+from threading import Thread
+from flask import Flask
 import discord
 from discord import app_commands
 from discord.ui import View, Select, Modal, TextInput, Button
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
-import datetime
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from threading import Thread       # 👈 新增：用於多執行緒
-from flask import Flask            # 👈 新增：輕量網頁伺服器
 
-# ================= 新增：防休眠 Flask 網頁設定 =================
+# ================= 1. Flask 防休眠網頁設定 =================
 app = Flask('')
-
 @app.route('/')
 def home():
-    return "🤖 牙材訂購機器人正在雲端穩定運作中！"
+    return "🤖 牙材團購 ERP 機器人在線運作中！"
 
 def run_web_server():
-    # Render 規定免費網頁專案必須綁定它指定的 PORT (通常是 10000)
     port = int(os.environ.get("PORT", 10000))
     app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
 
 def keep_alive():
-    # 建立一個背景執行緒來跑網頁伺服器，不干擾 Discord 機器人主體
     t = Thread(target=run_web_server)
+    t.daemon = True
     t.start()
-# =============================================================
-# ================= 0. 全域變數與資料庫連線 =================
-# ================= 1. Google Sheets 連線設定（修改為雲端安全版） =================
-scope = [
-    "https://spreadsheets.google.com/feeds",
-    "https://www.googleapis.com/auth/drive"
-]
 
-# 💡 雲端安全版：改由環境變數讀取 JSON 字串
+# ================= 2. Google Sheets 安全連線 =================
+scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
 google_creds_env = os.getenv("GOOGLE_CREDS_JSON")
+
 if google_creds_env:
-    creds_dict = json.loads(google_creds_env)
-    creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+    cleaned_json_str = google_creds_env.strip().strip('"').strip("'")
+    creds = ServiceAccountCredentials.from_json_keyfile_dict(json.loads(cleaned_json_str), scope)
 else:
-    # 如果本地測試找不到環境變數，就用原本的檔案
     creds = ServiceAccountCredentials.from_json_keyfile_name("creds.json", scope)
 
 gc = gspread.authorize(creds)
-# ... 中間的程式碼完全不需要變動 ...
-
-SPREADSHEET_NAME = "牙材_discord_bot" # ⚠️ 請修改為你實際的 Google Sheet 名稱
+SPREADSHEET_NAME = "牙材_discord_bot" # ⚠️ 請記得修改為你的 Google Sheet 名稱
 doc = gc.open(SPREADSHEET_NAME)
-inventory_sheet = doc.worksheet("Inventory")
-orders_sheet = doc.worksheet("Orders")
 
-# 系統收單狀態控制
+members_sheet = doc.worksheet("Members")
+products_sheet = doc.worksheet("Products")
+orders_sheet = doc.worksheet("Orders_Temp")
+
 IS_ORDER_OPEN = True
-ANNOUNCEMENT_CHANNEL_ID = None # 用來記錄發送結算報表的頻道 ID
+ANNOUNCEMENT_CHANNEL_ID = None
 scheduler = AsyncIOScheduler(timezone="Asia/Taipei")
 
-# ================= 2. 自動收單結算邏輯 =================
+# ================= 3. 輔助函式 (權限與即時計算) =================
+def get_member_info(user_id):
+    """從 Members 分頁取得使用者資料"""
+    try:
+        cell = members_sheet.find(str(user_id))
+        row = members_sheet.row_values(cell.row)
+        return {"姓名": row[1], "組別": row[2], "職位": row[3]}
+    except:
+        return None
+
+def get_live_product_summary():
+    """動態計算全班當前每項牙材累計訂購總量"""
+    all_orders = orders_sheet.get_all_records()
+    summary = {}
+    for o in all_orders:
+        item_id = str(o['Item_ID'])
+        qty = int(o['購買數量'])
+        summary[item_id] = summary.get(item_id, 0) + qty
+    return summary
+
+# ================= 4. 自動催單與最終結算自動分流 =================
+async def auto_reminder():
+    """截止前 3 天自動觸發的催單廣播"""
+    if not ANNOUNCEMENT_CHANNEL_ID: return
+    channel = bot.get_channel(ANNOUNCEMENT_CHANNEL_ID)
+    if not channel: return
+
+    products = products_sheet.get_all_records()
+    summary = get_live_product_summary()
+    
+    warning_text = ""
+    for p in products:
+        moq = int(p['最低購買量'])
+        if moq > 1:
+            current_total = summary.get(str(p['Item_ID']), 0)
+            if current_total < moq:
+                warning_text += f"⚠️ **[{p['品項名稱']}]** 目前全班僅湊 **{current_total}** / {moq} 支 (還差 {moq - current_total} 支才出貨！)\n"
+    
+    if warning_text:
+        embed = discord.Embed(title="🚨 牙材團購截止倒數 3 天：湊單危急品項公告！", description=warning_text, color=0xe67e22)
+        await channel.send(content="@everyone 倒數三天！未達出貨門檻之牙材在截止時將「無法下單」，請大家幫忙補刀湊單！", embed=embed)
+
 async def auto_close_order():
+    """自動截單並生成「牙材長叫貨表」與「小組長對帳表」"""
     global IS_ORDER_OPEN
     IS_ORDER_OPEN = False
-    print("⏰ 截止時間已到，系統已停止收單！")
-    
-    if not ANNOUNCEMENT_CHANNEL_ID:
-        return
+    if not ANNOUNCEMENT_CHANNEL_ID: return
     channel = bot.get_channel(ANNOUNCEMENT_CHANNEL_ID)
-    if not channel:
-        return
+    if not channel: return
 
     try:
-        orders = orders_sheet.get_all_records()
-        if not orders:
-            await channel.send("🔔 **本期訂購已截止！** 本期無任何人下單。")
-            return
+        all_orders = orders_sheet.get_all_records()
+        products = products_sheet.get_all_records()
+        prod_map = {str(p['Item_ID']): p for p in products}
+        summary = get_live_product_summary()
 
-        # 彙整統計資料
-        item_summary = {}
-        user_summary = {}
+        # 1. 建立當期全新 Excel 分頁
+        date_str = datetime.datetime.now().strftime("%m%d")
+        new_sheet_name = f"{date_str}牙材團購結算"
         
-        for order in orders:
-            item = str(order['Item_ID'])
-            qty = int(order['購買數量'])
-            price = int(order['單項總價'])
-            user = str(order['使用者名稱'])
+        try:
+            new_ws = doc.worksheet(new_sheet_name)
+            doc.del_worksheet(new_ws)
+        except: pass
+        new_ws = doc.add_worksheet(title=new_sheet_name, rows="100", cols="20")
+
+        # 2. 寫入 A 區：給牙材長的叫貨總表
+        new_ws.append_row(["【區塊 A：牙材長向廠商叫貨總表】"])
+        new_ws.append_row(["品項 ID", "品項名稱", "全班叫貨總量", "單價", "總金額", "出貨狀態"])
+        
+        valid_items = set()
+        for p in products:
+            item_id = str(p['Item_ID'])
+            total_qty = summary.get(item_id, 0)
+            moq = int(p['最低購買量'])
             
-            # 品項總計
-            item_summary[item] = item_summary.get(item, 0) + qty
-            # 使用者金額總計
-            user_summary[user] = user_summary.get(user, 0) + price
+            if total_qty == 0: continue
+            
+            if total_qty >= moq:
+                status = "✅ 達標成團"
+                valid_items.add(item_id)
+            else:
+                status = f"❌ ❌ 慘遭淘汰 (未滿最低購買量 {moq})"
+            
+            new_ws.append_row([item_id, p['品項名稱'], total_qty, p['單價'], total_qty * int(p['單價']), status])
 
-        embed = discord.Embed(title="🔒 本期牙材團購已自動截止！結算報表如下", color=0xe74c3c)
-        
-        # 品項統計表
-        item_text = ""
-        for item_id, total_qty in item_summary.items():
-            item_text += f"`[{item_id}]` 總計訂購：**{total_qty}** 個\n"
-        embed.add_field(name="📦 品項向廠商叫貨總量", value=item_text, inline=False)
-        
-        # 使用者繳費表
-        user_text = ""
-        for user_name, total_price in user_summary.items():
-            user_text += f"👤 **{user_name}**：應繳 NT$ {total_price:,}\n"
-        embed.add_field(name="💰 個人帳單總計", value=user_text, inline=False)
-        embed.set_footer(text="系統已自動鎖定訂購，欲修改請聯繫管理員人工處理。")
+        # 3. 寫入 B 區：給小組長的組內對帳明細
+        new_ws.append_row([])
+        new_ws.append_row(["【區塊 B：一至四組小組長分流對帳表】"])
+        new_ws.append_row(["組別", "同學姓名", "訂購明細 (成功成團品項)", "應匯款總額", "回報末五碼", "對帳狀態"])
 
-        await channel.send(content="角色標記提醒 @everyone", embed=embed)
+        # 以組別 (1~4) 進行分流彙整
+        group_billing = {}
+        for order in all_orders:
+            item_id = str(order['Item_ID'])
+            if item_id not in valid_items: continue # 淘汰的就不計費
+            
+            uid = str(order['Discord_User_ID'])
+            if uid not in group_billing:
+                group_billing[uid] = {
+                    "姓名": order['姓名'], "組別": order['組別'],
+                    "明細": [], "總價": 0, "末五碼": order.get('匯款末五碼', ''), "狀態": order.get('對帳狀態', '未匯款')
+                }
+            p_info = prod_map[item_id]
+            group_billing[uid]["明細"].append(f"{p_info['品項名稱']}x{order['購買數量']}")
+            group_billing[uid]["總價"] += int(order['單項總價'])
+
+        # 排序並寫入 Excel
+        sorted_members = sorted(group_billing.values(), key=lambda x: str(x['組別']))
+        for m in sorted_members:
+            new_ws.append_row([f"第 {m['組別']} 組", m['姓名'], ", ".join(m['明細']), m['總價'], m['末五碼'], m['狀態']])
+
+        await channel.send(f"🔒 **本期牙材團購已截止！**\n系統已自動在 Google Sheets 產生分頁 `[{new_sheet_name}]`！\nA區與B區報表皆已自動分流完畢，下單通道全面鎖定。")
+        
+        # 4. 私訊全班個人帳單
+        for user_id, data in group_billing.items():
+            try:
+                user = await bot.fetch_user(int(user_id))
+                embed = discord.Embed(title="🦷 您的當期牙材訂購個人帳單", color=0x3498db)
+                embed.add_field(name="訂購明細", value="\n".join(data["明細"]), inline=False)
+                embed.add_field(name="💰 應匯總金額", value=f"NT$ {data['總價']:,}", inline=False)
+                embed.set_footer(text="請匯款給您所屬的小組長後，回 Discord 頻道輸入 /回報匯款 登記對帳。")
+                await user.send(embed=embed)
+            except: pass
     except Exception as e:
-        print(f"產生報表錯誤: {e}")
+        print(f"結算崩潰: {e}")
 
-# ================= 3. 改單與下單 UI 元件 =================
-class ModifyModal(Modal):
-    def __init__(self, order_record, row_num):
-        super().__init__(title="修改訂單數量")
-        self.order = order_record
-        self.row_num = row_num
-        
-        self.new_qty_input = TextInput(
-            label=f"修改：{order_record['Item_ID']} 的購買數量",
-            default=str(order_record['購買數量']),
-            placeholder="請輸入修改後的正整數總量",
-            required=True,
-            max_length=4
-        )
-        self.add_item(self.new_qty_input)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        if not IS_ORDER_OPEN:
-            await interaction.response.send_message("❌ 本期訂購已截止，無法再修改訂單！", ephemeral=True)
-            return
-            
-        await interaction.response.defer(ephemeral=True)
-        try:
-            new_qty = int(self.new_qty_input.value)
-            if new_qty <= 0:
-                raise ValueError
-        except ValueError:
-            await interaction.followup.send("❌ 數量必須為正整數！", ephemeral=True)
-            return
-
-        old_qty = int(self.order['購買數量'])
-        diff = new_qty - old_qty # 差異量 (正數代表多買，負數代表退回)
-        
-        # 讀取當前庫存
-        inv_cell = inventory_sheet.find(str(self.order['Item_ID']))
-        inv_row_data = inventory_sheet.row_values(inv_cell.row)
-        current_stock = int(inv_row_data[3]) # 第4欄為當前庫存
-        unit_price = int(inv_row_data[2])    # 第3欄為單價
-        
-        if diff > 0 and current_stock < diff:
-            await interaction.followup.send(f"❌ 庫存不足以追加！目前庫存僅剩 **{current_stock}** 個。", ephemeral=True)
-            return
-
-        # 1. 更新庫存
-        inventory_sheet.update_cell(inv_cell.row, 4, current_stock - diff)
-        # 2. 更新訂單表 (第5欄數量, 第6欄總價)
-        orders_sheet.update_cell(self.row_num, 5, new_qty)
-        orders_sheet.update_cell(self.row_num, 6, new_qty * unit_price)
-
-        await interaction.followup.send(f"✅ 修改成功！訂單數量已更新為 **{new_qty}** 個，新總價：NT$ {new_qty * unit_price:,}", ephemeral=True)
-
-class ManageOrderView(View):
-    def __init__(self, order_record, row_num):
-        super().__init__(timeout=120)
-        self.order = order_record
-        self.row_num = row_num
-
-    @discord.ui.button(label="✏️ 修改數量", style=discord.ButtonStyle.primary)
-    async def modify_btn(self, interaction: discord.Interaction, button: Button):
-        if not IS_ORDER_OPEN:
-            await interaction.response.send_message("❌ 目前已結單，無法修改！", ephemeral=True)
-            return
-        await interaction.response.send_modal(ModifyModal(self.order, self.row_num))
-
-    @discord.ui.button(label="🗑️ 取消此訂單", style=discord.ButtonStyle.danger)
-    async def cancel_btn(self, interaction: discord.Interaction, button: Button):
-        if not IS_ORDER_OPEN:
-            await interaction.response.send_message("❌ 目前已結單，無法取消！", ephemeral=True)
-            return
-        await interaction.response.defer(ephemeral=True)
-        
-        # 退回庫存
-        inv_cell = inventory_sheet.find(str(self.order['Item_ID']))
-        current_stock = int(inventory_sheet.cell(inv_cell.row, 4).value)
-        inventory_sheet.update_cell(inv_cell.row, 4, current_stock + int(self.order['購買數量']))
-        
-        # 刪除訂單
-        orders_sheet.delete_rows(self.row_num)
-        await interaction.followup.send(f"✅ 訂單 `{self.order['Order_ID']}` 已成功取消，數量已全額退回庫存！", ephemeral=True)
-
-class MyOrdersSelect(Select):
-    def __init__(self, user_orders):
-        options = []
-        for order in user_orders:
-            options.append(discord.SelectOption(
-                label=f"品項: {order['data']['Item_ID']} | 數量: {order['data']['購買數量']}",
-                description=f"單號: {order['data']['Order_ID']} | 總價: ${order['data']['單項總價']}",
-                value=str(order['row'])
-            ))
-        super().__init__(placeholder="請選擇一筆您要修改或取消的訂單...", options=options)
-        self.user_orders = user_orders
-
-    async def callback(self, interaction: discord.Interaction):
-        selected_row = int(self.values[0])
-        selected_order = next(x['data'] for x in self.user_orders if x['row'] == selected_row)
-        
-        embed = discord.Embed(title="⚙️ 訂單管理與變更", color=0xf39c12)
-        embed.add_field(name="訂單編號", value=selected_order['Order_ID'])
-        embed.add_field(name="品項 ID", value=selected_order['Item_ID'])
-        embed.add_field(name="目前數量", value=selected_order['購買數量'])
-        
-        await interaction.response.send_message(
-            embed=embed, 
-            view=ManageOrderView(selected_order, selected_row), 
-            ephemeral=True
-        )
-
-# ================= 4. 新增的下單 Modal 邏輯 (保留上一步驟功能) =================
+# ================= 5. 下單與對帳 UI 元件 =================
 class OrderModal(Modal):
-    def __init__(self, item):
-        super().__init__(title=f"訂購：{item['品項名稱']}")
-        self.item = item
-        self.quantity_input = TextInput(
-            label="請輸入購買數量",
-            placeholder=f"目前庫存: {item['當前庫存']} | 單價: NT$ {item['單價']}",
-            required=True, max_length=4
-        )
-        self.add_item(self.quantity_input)
+    def __init__(self, product):
+        super().__init__(title=f"訂購：{product['品項名稱']}")
+        self.product = product
+        self.qty_input = TextInput(label="請輸入欲購買數量", placeholder="請輸入正整數", required=True)
+        self.add_item(self.qty_input)
 
     async def on_submit(self, interaction: discord.Interaction):
         if not IS_ORDER_OPEN:
-            await interaction.response.send_message("❌ 本期訂購已自動截止！", ephemeral=True)
+            await interaction.response.send_message("❌ 本期訂購已截止！", ephemeral=True)
             return
-        await interaction.response.defer(ephemeral=True)
+        mem = get_member_info(interaction.user.id)
+        if not mem:
+            await interaction.response.send_message("❌ 找不到您的班級名冊紀錄，請先聯繫牙材長在 Members 表格中登記您的 Discord ID！", ephemeral=True)
+            return
+
         try:
-            qty = int(self.quantity_input.value)
+            qty = int(self.qty_input.value)
             if qty <= 0: raise ValueError
-        except ValueError:
-            await interaction.followup.send("❌ 格式錯誤！請輸入正整數。", ephemeral=True)
+        except:
+            await interaction.response.send_message("❌ 數量輸入錯誤，請輸入正整數！", ephemeral=True)
             return
 
-        all_items = inventory_sheet.get_all_records()
-        current_item = next((x for x in all_items if str(x["Item_ID"]) == str(self.item["Item_ID"])), None)
-        if not current_item or current_item["當前庫存"] < qty:
-            await interaction.followup.send("❌ 庫存不足！", ephemeral=True)
-            return
-
-        total_price = qty * int(current_item["單價"])
-        cell = inventory_sheet.find(str(self.item["Item_ID"]))
-        inventory_sheet.update_cell(cell.row, 4, current_item["當前庫存"] - qty)
-        
+        total_price = qty * int(self.product['單價'])
         order_id = f"ORD-{int(datetime.datetime.now().timestamp())}"
-        orders_sheet.append_row([order_id, str(interaction.user.id), interaction.user.display_name, str(self.item["Item_ID"]), qty, total_price])
+        
+        # 直接追加到暫存區
+        orders_sheet.append_row([
+            order_id, str(interaction.user.id), mem['姓名'], mem['組別'], 
+            str(self.product['Item_ID']), qty, total_price, "", "未匯款"
+        ])
+        await interaction.response.send_message(f"✅ 成功加入暫存訂單！\n**品項：** {self.product['品項名稱']} x {qty}\n**當前小計：** NT$ {total_price:,}", ephemeral=True)
 
-        embed = discord.Embed(title="✅ 訂購成功！", color=0x2ecc71)
-        embed.add_field(name="單號", value=order_id); embed.add_field(name="數量", value=str(qty)); embed.add_field(name="總價", value=f"NT$ {total_price:,}")
-        await interaction.followup.send(embed=embed, ephemeral=True)
+class ProductSelect(Select):
+    def __init__(self, products):
+        summary = get_live_product_summary()
+        options = []
+        for p in products:
+            item_id = str(p['Item_ID'])
+            current_total = summary.get(item_id, 0)
+            moq = int(p['最低購買量'])
+            
+            # 動態組裝即時預訂量說明
+            if moq <= 1:
+                desc = f"單價: ${p['單價']} | 全班已訂: {current_total} 個"
+            else:
+                desc = f"湊單制 | 進度: {current_total}/{moq} (還差 {max(0, moq-current_total)} 支)"
+                
+            options.append(discord.SelectOption(label=p['品項名稱'], description=desc, value=item_id))
+        super().__init__(placeholder="請選擇你要訂購的牙材品項...", options=options)
+        self.products = products
 
-class ItemSelect(Select):
-    def __init__(self, items):
-        options = [discord.SelectOption(label=f"{i['品項名稱']} (${i['單價']})", description=f"剩餘: {i['當前庫存']}", value=str(i["Item_ID"])) for i in items if int(i["當前庫存"]) > 0]
-        if not options: options = [discord.SelectOption(label="已售完", value="none")]
-        super().__init__(placeholder="請選擇品項...", options=options)
-        self.items = items
     async def callback(self, interaction: discord.Interaction):
-        if self.values[0] == "none": return
-        selected = next((i for i in self.items if str(i["Item_ID"]) == self.values[0]), None)
-        if selected: await interaction.response.send_modal(OrderModal(selected))
+        selected = next(p for p in self.products if str(p['Item_ID']) == self.values[0])
+        await interaction.response.send_modal(OrderModal(selected))
 
-# ================= 5. 機器人主體與指令 =================
-class DentalBot(discord.Client):
+# ================= 6. 機器人主體指令群 =================
+class DentalERPBot(discord.Client):
     def __init__(self):
         super().__init__(intents=discord.Intents.default())
         self.tree = app_commands.CommandTree(self)
     async def setup_hook(self):
         scheduler.start()
         await self.tree.sync()
-        print("🤖 斜線指令與排程器已啟動！")
 
-bot = DentalBot()
+bot = DentalERPBot()
 
-@bot.tree.command(name="訂購牙材", description="開啟牙材訂購介面")
-async def order_command(interaction: discord.Interaction):
-    if not IS_ORDER_OPEN:
-        await interaction.response.send_message("🔒 本期訂購已截止，目前不開放下單！", ephemeral=True)
-        return
-    items = inventory_sheet.get_all_records()
-    view = View(); view.add_item(ItemSelect(items))
-    await interaction.response.send_message("🦷 **請從下方選單選擇欲訂購的牙材：**", view=view)
-
-@bot.tree.command(name="我的訂單", description="查詢自己目前的訂單，可修改數量或取消")
-async def my_orders_command(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True)
-    all_orders = orders_sheet.get_all_records()
-    
-    # 找出自己的訂單與其在表格中的行號 (Header 是第1行，資料從第2行開始)
-    user_orders = []
-    for idx, order in enumerate(all_orders, start=2):
-        if str(order['Discord_User_ID']) == str(interaction.user.id):
-            user_orders.append({'row': idx, 'data': order})
-            
-    if not user_orders:
-        await interaction.followup.send("❌ 您目前沒有任何暫存訂單紀錄！", ephemeral=True)
-        return
-
-    view = View()
-    view.add_item(MyOrdersSelect(user_orders))
-    await interaction.followup.send("📋 **以下是您目前的訂購明細，請點選選單進行修改或取消：**", view=view, ephemeral=True)
-
-@bot.tree.command(name="設定截止時間", description="【管理員專用】設定自動收單時間 (格式: YYYY-MM-DD HH:MM)")
-async def set_deadline_command(interaction: discord.Interaction, time_str: str):
+@bot.tree.command(name="開團訂購牙材", description="【牙材長專用】設定開團與截止時間並啟動監控")
+@app_commands.describe(time_str="格式: YYYY-MM-DD HH:MM")
+async def start_group_buy(interaction: discord.Interaction, time_str: str):
     global IS_ORDER_OPEN, ANNOUNCEMENT_CHANNEL_ID
-    if not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message("❌ 只有管理員可以使用此指令！", ephemeral=True)
+    mem = get_member_info(interaction.user.id)
+    if not mem or mem['職位'] != "牙材長":
+        await interaction.response.send_message("❌ 您非牙材長，權限不足！", ephemeral=True)
         return
 
     try:
         dt = datetime.datetime.strptime(time_str, "%Y-%m-%d %H:%M")
-        now = datetime.datetime.now()
-        if dt <= now:
-            await interaction.response.send_message("❌ 截止時間必須設定在「未來的時間」！", ephemeral=True)
+        if dt <= datetime.datetime.now():
+            await interaction.response.send_message("❌ 截止時間必須是未來的時間！", ephemeral=True)
             return
 
         IS_ORDER_OPEN = True
         ANNOUNCEMENT_CHANNEL_ID = interaction.channel_id
-        
-        # 移除舊任務並新增自動結算任務
         scheduler.remove_all_jobs()
-        scheduler.add_job(auto_close_order, 'date', run_date=dt)
         
-        await interaction.response.send_message(f"⏰ **已成功設定收單倒數！**\n系統將於 `{time_str}` 自動關閉下單，並在此頻道發布結算報表。")
-    except ValueError:
-        await interaction.response.send_message("❌ 格式錯誤！請依照格式輸入，例如：`2026-07-10 18:00`", ephemeral=True)
+        # 排程：截止當下自動收單
+        scheduler.add_job(auto_close_order, 'date', run_date=dt)
+        # 排程：截止前 3 天發布自動催單 (若開團時間短於三天，則會自動忽略或可手動觸發)
+        reminder_time = dt - datetime.timedelta(days=3)
+        if reminder_time > datetime.datetime.now():
+            scheduler.add_job(auto_reminder, 'date', run_date=reminder_time)
 
-@bot.tree.command(name="立即收單", description="【管理員專用】強制提早收單並印出報表")
-async def force_close_command(interaction: discord.Interaction):
-    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message(f"📢 **牙材團購正式開跑！**\n系統將在 `{time_str}` 自動截止、鎖定並結算。前 3 天會自動發布 MOQ 湊單催促公告。")
+    except Exception as e:
+        await interaction.response.send_message(f"❌ 時間格式錯誤！請依照範例輸入：`2026-07-30 23:59`", ephemeral=True)
+
+@bot.tree.command(name="訂購牙材", description="挑選當期牙材並進行訂購（選單即時顯示全班當前湊單總量）")
+async def order_material(interaction: discord.Interaction):
+    if not IS_ORDER_OPEN:
+        await interaction.response.send_message("❌ 目前非開團期間，無法進行訂購！", ephemeral=True)
+        return
+    products = products_sheet.get_all_records()
+    view = View()
+    view.add_item(ProductSelect(products))
+    await interaction.response.send_message("🦷 **請由下方選單挑選品項，後方皆會同步顯示班級當前即時累計湊單進度：**", view=view, ephemeral=True)
+
+@bot.tree.command(name="回報匯款", description="【全班同學】匯款給小組長後，回報您的帳戶末五碼登記對帳")
+async def report_payment(interaction: discord.Interaction,末五碼: str):
+    await interaction.response.defer(ephemeral=True)
+    all_orders = orders_sheet.get_all_records()
+    
+    updated = False
+    for idx, order in enumerate(all_orders, start=2):
+        if str(order['Discord_User_ID']) == str(interaction.user.id):
+            orders_sheet.update_cell(idx, 8, str(末五碼)) # 第8欄是末五碼
+            orders_sheet.update_cell(idx, 9, "已匯款待審核") # 第9欄是狀態
+            updated = True
+            
+    if updated:
+        await interaction.followup.send(f"✅ 匯款回報成功！已登記末五碼 `[{末五碼}]`，已通知您所屬的小組長進行審核對帳。", ephemeral=True)
+    else:
+        await interaction.followup.send("❌ 找不到您在本期的訂單明細，請確認您是否有下單成功。", ephemeral=True)
+
+@bot.tree.command(name="組內對帳", description="【小組長專用】查看自己組內 9 位同學的末五碼回報與繳費進度")
+async def group_check(interaction: discord.Interaction):
+    leader = get_member_info(interaction.user.id)
+    if not leader or leader['職位'] != "小組長":
+        await interaction.response.send_message("❌ 您非登記之小組長，無法使用此指令！", ephemeral=True)
+        return
+
+    all_orders = orders_sheet.get_all_records()
+    embed = discord.Embed(title=f"📋 第 {leader['組別']} 組組內繳費對帳進度報告", color=0x9b59b6)
+    
+    found = False
+    for order in all_orders:
+        if str(order['組別']) == str(leader['組別']):
+            found = True
+            status_text = f"💰 金額: ${order['單項總價']} | 狀態: **{order['對帳狀態']}**"
+            if order['匯款末五碼']:
+                status_text += f" (末五碼: {order['匯款末五碼']})"
+            embed.add_field(name=f"👤 {order['姓名']}", value=status_text, inline=False)
+            
+    if not found:
+        embed.description = "目前本組內尚無任何人下單。"
+        
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+@bot.tree.command(name="確認收妥", description="【小組長專用】確認網銀入帳後，將該同學狀態改為已確認完款")
+async def confirm_payment(interaction: discord.Interaction, 同學姓名: str):
+    leader = get_member_info(interaction.user.id)
+    if not leader or leader['職位'] != "小組長":
         await interaction.response.send_message("❌ 權限不足！", ephemeral=True)
         return
-    global ANNOUNCEMENT_CHANNEL_ID
-    ANNOUNCEMENT_CHANNEL_ID = interaction.channel_id
-    await interaction.response.send_message("🚨 **管理員已觸發強制收單！** 正在運算報表...")
-    await auto_close_order()
 
-# ================= 最底部啟動機器人（修改為雲端安全版） =================
+    all_orders = orders_sheet.get_all_records()
+    updated = False
+    for idx, order in enumerate(all_orders, start=2):
+        if str(order['組別']) == str(leader['組別']) and str(order['姓名']) == str(同學姓名):
+            orders_sheet.update_cell(idx, 9, "✅ 已收妥完款")
+            updated = True
+            
+    if updated:
+        await interaction.response.send_message(f"👍 已成功將同學 **{同學姓名}** 的對帳狀態變更為「✅ 已收妥完款」！", ephemeral=True)
+    else:
+        await interaction.response.send_message(f"❌ 在您的組內找不到名為 **{同學姓名}** 的當期訂單，請檢查字是否有打錯。", ephemeral=True)
+
+# ================= 最底部啟動點 =================
 if __name__ == "__main__":
     DISCORD_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
-    
-    # 1. 💡 第一優先：先讓網頁伺服器跑起來，去應付 Render 的檢查與 UptimeRobot
-    print("🌐 正在啟動 Flask 背景網頁服務...")
+    print("🌐 正在啟動 Flask 背景網頁服務（Render 專用防休眠）...")
     keep_alive()
-    
-    # 2. 第二優先：接著才去連線 Discord
-    print("🤖 正在連線至 Discord...")
+    print("🤖 正在連線至 Discord 核心伺服器...")
     bot.run(DISCORD_TOKEN)
