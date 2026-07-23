@@ -205,12 +205,15 @@ class MultiOrderModal(Modal):
             self.inputs.append((p, inp))
 
     async def on_submit(self, interaction: discord.Interaction):
+        # 💡 新增 defer()：因為寫入多筆資料到 Google 表單也可能超過 3 秒
+        await interaction.response.defer(ephemeral=True)
+        
         if not IS_ORDER_OPEN:
-            await interaction.response.send_message("❌ 目前非訂購期間！", ephemeral=True)
+            await interaction.followup.send("❌ 目前非訂購期間！", ephemeral=True)
             return
         mem = get_member_info(interaction.user.id)
         if not mem:
-            await interaction.response.send_message("❌ 找不到您的名冊紀錄！請先使用 `/綁定名冊`！", ephemeral=True)
+            await interaction.followup.send("❌ 找不到您的名冊紀錄！請先使用 `/綁定名冊`！", ephemeral=True)
             return
 
         rows_to_add = []
@@ -223,7 +226,7 @@ class MultiOrderModal(Modal):
                 qty = int(inp.value)
                 if qty <= 0: raise ValueError
             except ValueError:
-                await interaction.response.send_message(f"❌ 數量輸入錯誤：{p['品項名稱']} 必須為正整數！", ephemeral=True)
+                await interaction.followup.send(f"❌ 數量輸入錯誤：{p['品項名稱']} 必須為正整數！", ephemeral=True)
                 return
             
             subtotal = qty * int(p['單價'])
@@ -236,7 +239,9 @@ class MultiOrderModal(Modal):
         # 批次寫入 Google Sheets (效能更好)
         orders_sheet.append_rows(rows_to_add)
         reply_msg += f"\n**本次新增總金額：** NT$ {total_cost:,}\n*(可使用 `/我的訂單` 檢視或修改)*"
-        await interaction.response.send_message(reply_msg, ephemeral=True)
+        
+        # 💡 將 response.send_message 改為 followup.send
+        await interaction.followup.send(reply_msg, ephemeral=True)
 
 class ProductSelect(Select):
     def __init__(self, products):
@@ -376,11 +381,19 @@ async def order_material(interaction: discord.Interaction):
     if not IS_ORDER_OPEN:
         await interaction.response.send_message("❌ 目前非訂購期間，無法進行訂購！", ephemeral=True)
         return
-    products = products_sheet.get_all_records()
-    view = View()
-    view.add_item(ProductSelect(products))
-    # 提醒 Discord UI 的限制
-    await interaction.response.send_message("🦷 **請勾選欲訂購的品項：**\n*(註：受限於系統，單次最多只能同時結帳 5 項。若超過 5 項請分多次下單！)*", view=view, ephemeral=True)
+        
+    # 💡 核心解法：先 defer，讓機器人顯示「正在思考中...」，爭取讀取 Excel 的時間
+    await interaction.response.defer(ephemeral=True)
+    
+    try:
+        products = products_sheet.get_all_records()
+        view = View()
+        view.add_item(ProductSelect(products))
+        
+        # 💡 已經 defer 過了，這裡要改成使用 followup.send 來發送真正的訊息
+        await interaction.followup.send("🦷 **請勾選欲訂購的品項：**\n*(註：受限於系統，單次最多只能同時結帳 5 項。若超過 5 項請分多次下單！)*", view=view, ephemeral=True)
+    except Exception as e:
+        await interaction.followup.send(f"❌ 讀取資料失敗，可能網路延遲過大，請稍後再試。錯誤: {e}", ephemeral=True)
 
 
 @bot.tree.command(name="我的訂單", description="【個人專用】檢視自己目前的暫存訂單，可修改刪除")
