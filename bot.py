@@ -194,9 +194,12 @@ class MultiOrderModal(Modal):
         self.inputs = []
         
         for p in selected_products:
-            # 建立每個品項的輸入框
+            # 建立每個品項的輸入框，並防呆 '單價'
+            try: price = int(p.get('單價', 0) or 0)
+            except: price = 0
+                
             inp = TextInput(
-                label=f"{p['品項名稱']} (單價:${p['單價']})", 
+                label=f"{p['品項名稱']} (單價:${price})", 
                 placeholder="請輸入數量", 
                 required=True,
                 max_length=4
@@ -229,7 +232,11 @@ class MultiOrderModal(Modal):
                 await interaction.followup.send(f"❌ 數量輸入錯誤：{p['品項名稱']} 必須為正整數！", ephemeral=True)
                 return
             
-            subtotal = qty * int(p['單價'])
+            # 防呆 '單價'
+            try: price = int(p.get('單價', 0) or 0)
+            except: price = 0
+                
+            subtotal = qty * price
             total_cost += subtotal
             # 產生唯一訂單編號
             order_id = f"ORD-{uuid.uuid4().hex[:6].upper()}"
@@ -250,9 +257,17 @@ class ProductSelect(Select):
         for p in products:
             item_id = str(p['Item_ID'])
             current_total = summary.get(item_id, 0)
-            moq = int(p['最低購買量'])
+            
+            # 防呆：處理最低購買量為空的問題
+            try: moq = int(p.get('最低購買量', 1) or 1)
+            except: moq = 1
+                
+            # 防呆：處理單價為空的問題
+            try: price = int(p.get('單價', 0) or 0)
+            except: price = 0
+
             if moq <= 1:
-                desc = f"單價: ${p['單價']} | 全班已訂: {current_total} 個"
+                desc = f"單價: ${price} | 全班已訂: {current_total} 個"
             else:
                 desc = f"湊單制 | 進度: {current_total}/{moq} (還差 {max(0, moq-current_total)} 支)"
             options.append(discord.SelectOption(label=p['品項名稱'], description=desc, value=item_id))
