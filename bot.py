@@ -86,25 +86,26 @@ def get_live_product_summary():
     return summary
 
 def get_sys_config(key):
-    """從 System_Config 讀取系統設定"""
+    """從 System_Config 讀取系統設定 (升級版：不受標題名稱影響)"""
     try:
-        records = sys_sheet.get_all_records()
-        for row in records:
-            if str(row.get('Key', '')).strip() == key:
-                return str(row.get('Value', '')).strip()
+        all_values = sys_sheet.get_all_values()
+        for row in all_values:
+            if len(row) >= 2 and str(row[0]).strip() == key:
+                return str(row[1]).strip()
     except:
         pass
     return None
 
 def update_sys_config(key, value):
-    """更新或新增系統設定至 System_Config"""
+    """更新或新增系統設定至 System_Config (升級版：精準覆蓋不重複)"""
     try:
-        records = sys_sheet.get_all_records()
-        for i, row in enumerate(records):
-            if str(row.get('Key', '')).strip() == key:
-                sys_sheet.update_cell(i + 2, 2, f"'{value}")
+        all_values = sys_sheet.get_all_values()
+        for i, row in enumerate(all_values):
+            if len(row) > 0 and str(row[0]).strip() == key:
+                # i 是 index，從 0 開始，Google Sheet 列數從 1 開始，所以是 i + 1
+                sys_sheet.update_cell(i + 1, 2, f"'{value}")
                 return
-        # 如果找不到對應的 Key，則新增一行
+        # 如果整張表都找不到對應的 Key，才新增一行
         sys_sheet.append_row([key, f"'{value}"])
     except:
         pass
@@ -494,6 +495,53 @@ async def force_close_order(interaction: discord.Interaction):
         await auto_close_order()
     except Exception as e:
         await interaction.followup.send(f"❌ 強制關團時發生錯誤：{e}", ephemeral=True)
+
+@bot.tree.command(name="修改截止時間", description="【牙材長專用】修改當前團購的截止時間")
+async def modify_deadline(interaction: discord.Interaction, 新截止時間: str):
+    global IS_ORDER_OPEN, ANNOUNCEMENT_CHANNEL_ID
+    mem = get_member_info(interaction.user.id)
+    if not mem or "牙材長" not in str(mem.get('職位', '')):
+        await interaction.response.send_message("❌ 您非牙材長，權限不足！", ephemeral=True)
+        return
+
+    if not IS_ORDER_OPEN:
+        await interaction.response.send_message("❌ 目前沒有正在進行中的團購，請先使用 `/開團訂購牙材`！", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    try:
+        dt = datetime.datetime.strptime(新截止時間, "%Y-%m-%d %H:%M")
+    except ValueError:
+        await interaction.followup.send(f"❌ 時間格式錯誤！請依照格式輸入：`2026-07-30 23:59`\n（您剛才輸入的是：`{新截止時間}`）", ephemeral=True)
+        return
+
+    if dt <= datetime.datetime.now():
+        await interaction.followup.send("❌ 截止時間必須是未來的時間！", ephemeral=True)
+        return
+
+    try:
+        # 清除舊任務
+        scheduler.remove_all_jobs()
+        
+        # 重新加入新排程
+        scheduler.add_job(auto_close_order, 'date', run_date=dt)
+        reminder_time = dt - datetime.timedelta(days=3)
+        if reminder_time > datetime.datetime.now():
+            scheduler.add_job(auto_reminder, 'date', run_date=reminder_time)
+
+        # 更新中控台設定
+        update_sys_config("CLOSE_TIME", 新截止時間)
+        
+        await interaction.followup.send(f"✅ 成功修改！新的截止時間為 `{新截止時間}`。", ephemeral=True)
+        
+        # 發送公告提醒同學
+        if ANNOUNCEMENT_CHANNEL_ID:
+            channel = bot.get_channel(ANNOUNCEMENT_CHANNEL_ID)
+            if channel:
+                await channel.send(f"📢 **【牙材長公告】截單時間已變更！**\n新的截單時間延長/縮短至 `{新截止時間}`，請大家留意下單時間！")
+                
+    except Exception as e:
+        await interaction.followup.send(f"❌ 修改時間失敗，系統發生錯誤：`{e}`", ephemeral=True)
 
 @bot.tree.command(name="訂購牙材", description="挑選當期牙材並進行訂購（可一次勾選多項）")
 async def order_material(interaction: discord.Interaction):
