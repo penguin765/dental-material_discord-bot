@@ -114,14 +114,19 @@ async def auto_close_order():
             await channel.send("🔒 本期訂購已截止，因無任何同學下單，系統不生成報表。")
             return
 
+        await channel.send("⏳ 正在產生歷史流水帳與結算報表，因資料量大可能需時數秒，請稍候...")
+
         # ─── 步驟一：建立當期原始流水帳備份 (歷史保留) ───
         raw_sheet_name = f"歷史_{date_str}原始明細"
         try: doc.del_worksheet(doc.worksheet(raw_sheet_name))
         except: pass
         raw_ws = doc.add_worksheet(title=raw_sheet_name, rows="100", cols="10")
-        raw_ws.append_row(["Order_ID", "Discord_User_ID", "姓名", "組別", "Item_ID", "購買數量", "單項總價", "匯款末五碼", "對帳狀態"])
+        
+        # 🚀 效能優化：批次打包寫入 (防止 Google API 限制)
+        raw_data = [["Order_ID", "Discord_User_ID", "姓名", "組別", "Item_ID", "購買數量", "單項總價", "匯款末五碼", "對帳狀態"]]
         for o in all_orders:
-            raw_ws.append_row([o['Order_ID'], str(o['Discord_User_ID']), o['姓名'], o['組別'], str(o['Item_ID']), o['購買數量'], o['單項總價'], o['匯款末五碼'], o['對帳狀態']])
+            raw_data.append([o['Order_ID'], str(o['Discord_User_ID']), o['姓名'], o['組別'], str(o['Item_ID']), o['購買數量'], o['單項總價'], o['匯款末五碼'], o['對帳狀態']])
+        raw_ws.append_rows(raw_data)
 
         # ─── 步驟二：建立二合一結算報表 (牙材長+小組長) ───
         settle_sheet_name = f"{date_str}牙材團購結算"
@@ -129,26 +134,33 @@ async def auto_close_order():
         except: pass
         settle_ws = doc.add_worksheet(title=settle_sheet_name, rows="100", cols="10")
 
-        # A 區寫入
-        settle_ws.append_row(["【區塊 A：牙材長向廠商叫貨總表】"])
-        settle_ws.append_row(["品項 ID", "品項名稱", "全班叫貨總量", "單價", "總金額", "出貨狀態"])
+        settle_data = [] # 準備一次性寫入的資料容器
+
+        # A 區寫入準備
+        settle_data.append(["【區塊 A：牙材長向廠商叫貨總表】"])
+        settle_data.append(["品項 ID", "品項名稱", "全班叫貨總量", "單價", "總金額", "出貨狀態"])
         valid_items = set()
         for p in products:
             item_id = str(p['Item_ID'])
             total_qty = summary.get(item_id, 0)
-            moq = int(p['最低購買量'])
+            
+            try: moq = int(p.get('最低購買量', 1) or 1)
+            except: moq = 1
+            try: price = int(p.get('單價', 0) or 0)
+            except: price = 0
+
             if total_qty == 0: continue
             if total_qty >= moq:
                 status = "✅ 達標成團"
                 valid_items.add(item_id)
             else:
                 status = f"❌ 淘汰 (未滿最低購買量 {moq})"
-            settle_ws.append_row([item_id, p['品項名稱'], total_qty, p['單價'], total_qty * int(p['單價']), status])
+            settle_data.append([item_id, p.get('品項名稱', '未知品項'), total_qty, price, total_qty * price, status])
 
-        # B 區寫入
-        settle_ws.append_row([])
-        settle_ws.append_row(["【區塊 B：一至四組小組長分流對帳表】"])
-        settle_ws.append_row(["組別", "同學姓名", "訂購明細 (成功成團品項)", "應匯款總額", "回報末五碼", "對帳狀態"])
+        # B 區寫入準備
+        settle_data.append([])
+        settle_data.append(["【區塊 B：各小組分流對帳表】"])
+        settle_data.append(["組別", "同學姓名", "訂購明細 (成功成團品項)", "應匯款總額", "回報末五碼", "對帳狀態"])
 
         group_billing = {}
         for order in all_orders:
@@ -157,19 +169,25 @@ async def auto_close_order():
             uid = str(order['Discord_User_ID'])
             if uid not in group_billing:
                 group_billing[uid] = {"姓名": order['姓名'], "組別": order['組別'], "明細": [], "總價": 0}
-            p_info = prod_map[item_id]
-            group_billing[uid]["明細"].append(f"{p_info['品項名稱']}x{order['購買數量']}")
-            group_billing[uid]["總價"] += int(order['單項總價'])
+            
+            p_info = prod_map.get(item_id, {"品項名稱": "未知品項"})
+            group_billing[uid]["明細"].append(f"{p_info.get('品項名稱', '未知')}x{order['購買數量']}")
+            try: subtotal = int(order.get('單項總價', 0) or 0)
+            except: subtotal = 0
+            group_billing[uid]["總價"] += subtotal
 
-        sorted_members = sorted(group_billing.values(), key=lambda x: str(x['組別']))
+        sorted_members = sorted(group_billing.values(), key=lambda x: str(x.get('組別', '')))
         for m in sorted_members:
-            settle_ws.append_row([f"第 {m['組別']} 組", m['姓名'], ", ".join(m['明細']), m['總價'], "", "未匯款"])
+            settle_data.append([f"第 {m['組別']} 組", m['姓名'], ", ".join(m['明細']), m['總價'], "", "未匯款"])
+
+        # 🚀 效能優化：一次性把整份結算報表貼上 Google Sheet
+        settle_ws.append_rows(settle_data)
 
         # ─── 步驟三：洗碗清空廚房 (重置 Orders_Temp) ───
         orders_sheet.clear()
         orders_sheet.append_row(["Order_ID", "Discord_User_ID", "姓名", "組別", "Item_ID", "購買數量", "單項總價", "匯款末五碼", "對帳狀態"])
 
-        await channel.send(f"🔒 **本期牙材訂購已截止！**\n系統已產生歷史備份 `[{raw_sheet_name}]` 與結算報表 `[{settle_sheet_name}]`！\n**當期暫存工作區已全數清空重置**，下單通道關閉。")
+        await channel.send(f"🔒 **本期牙材訂購已順利截止！**\n系統已成功產生歷史備份 `[{raw_sheet_name}]` 與結算報表 `[{settle_sheet_name}]`！\n**當期暫存工作區已全數清空重置**，下單通道關閉。")
         
         # ─── 步驟四：發送個人帳單私訊 ───
         for user_id, data in group_billing.items():
@@ -182,7 +200,10 @@ async def auto_close_order():
                 await user.send(embed=embed)
             except: pass
     except Exception as e:
-        print(f"自動結算時發生崩潰: {e}")
+        # 新增錯誤回報：如果再次崩潰，會把錯誤原因傳到頻道讓你知道
+        import traceback
+        print(f"自動結算時發生崩潰:\n{traceback.format_exc()}")
+        await channel.send(f"❌ **自動截單時發生錯誤，報表產生失敗！**\n錯誤代碼：`{e}`\n👉 請牙材長手動前往備份 `Orders_Temp` 後聯繫管理員。")
 
 # ================= 5. 下單 UI 與 取消訂單 UI =================
 
@@ -478,8 +499,8 @@ async def report_payment(interaction: discord.Interaction, 末五碼: str):
 @bot.tree.command(name="組內對帳", description="【小組長專用】查看自己組內同學的繳費進度")
 async def group_check(interaction: discord.Interaction):
     leader = get_member_info(interaction.user.id)
-    # 修正 1：利用 in 判斷，允許雙重身分
-    if not leader or "小組長" not in leader['職位']:
+    # 支援「小組長1」、「小組長2」、「牙材長,小組長」等多重或帶數字的職位
+    if not leader or "小組長" not in str(leader.get('職位', '')):
         await interaction.response.send_message("❌ 您非登記之小組長，權限不足！", ephemeral=True)
         return
 
@@ -496,10 +517,10 @@ async def group_check(interaction: discord.Interaction):
     for row in records:
         if str(row.get('組別')) == f"第 {leader['組別']} 組":
             found = True
-            status_text = f"💰 應繳: ${row['應匯款總額']} | 狀態: **{row['對帳狀態']}**"
+            status_text = f"💰 應繳: ${row.get('應匯款總額', 0)} | 狀態: **{row.get('對帳狀態', '未知')}**"
             if row.get('回報末五碼'):
                 status_text += f" (末五碼: {row['回報末五碼']})"
-            embed.add_field(name=f"👤 {row['同學姓名']}", value=status_text, inline=False)
+            embed.add_field(name=f"👤 {row.get('同學姓名', '未知')}", value=status_text, inline=False)
             
     if not found: embed.description = "本期本組無人需繳費。"
     await interaction.response.send_message(embed=embed, ephemeral=True)
@@ -508,8 +529,8 @@ async def group_check(interaction: discord.Interaction):
 @bot.tree.command(name="確認收妥", description="【小組長專用】核對網銀入帳後，變更同學狀態為已完款")
 async def confirm_payment(interaction: discord.Interaction, 同學姓名: str):
     leader = get_member_info(interaction.user.id)
-    # 修正 1：利用 in 判斷，允許雙重身分
-    if not leader or "小組長" not in leader['職位']:
+    # 支援「小組長1」、「小組長2」、「牙材長,小組長」等多重或帶數字的職位
+    if not leader or "小組長" not in str(leader.get('職位', '')):
         await interaction.response.send_message("❌ 權限不足！", ephemeral=True)
         return
 
@@ -522,7 +543,7 @@ async def confirm_payment(interaction: discord.Interaction, 同學姓名: str):
     records = target_settle_sheet.get_all_records()
     updated = False
     for idx, row in enumerate(records, start=5):
-        if str(row.get('組別')) == f"第 {leader['組別']} 組" and row.get('同學姓名') == 同學姓名:
+        if str(row.get('組別')) == f"第 {leader['組別']} 組" and str(row.get('同學姓名')) == 同學姓名:
             target_settle_sheet.update_cell(idx, 6, "✅ 已收妥完款")
             updated = True
             break
