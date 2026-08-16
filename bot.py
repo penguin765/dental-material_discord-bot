@@ -122,10 +122,10 @@ async def auto_close_order():
         except: pass
         raw_ws = doc.add_worksheet(title=raw_sheet_name, rows="100", cols="10")
         
-        # 🚀 效能優化：批次打包寫入 (防止 Google API 限制)
-        raw_data = [["Order_ID", "Discord_User_ID", "姓名", "組別", "Item_ID", "購買數量", "單項總價", "匯款末五碼", "對帳狀態"]]
+        # 🚀 效能優化：移除多餘欄位，批次打包寫入 (防止 Google API 限制)
+        raw_data = [["Order_ID", "Discord_User_ID", "姓名", "組別", "Item_ID", "購買數量", "單項總價"]]
         for o in all_orders:
-            raw_data.append([o['Order_ID'], str(o['Discord_User_ID']), o['姓名'], o['組別'], str(o['Item_ID']), o['購買數量'], o['單項總價'], o['匯款末五碼'], o['對帳狀態']])
+            raw_data.append([o['Order_ID'], str(o['Discord_User_ID']), o['姓名'], o['組別'], str(o['Item_ID']), o['購買數量'], o['單項總價']])
         raw_ws.append_rows(raw_data)
 
         # ─── 步驟二：建立二合一結算報表 (牙材長+小組長) ───
@@ -185,7 +185,7 @@ async def auto_close_order():
 
         # ─── 步驟三：洗碗清空廚房 (重置 Orders_Temp) ───
         orders_sheet.clear()
-        orders_sheet.append_row(["Order_ID", "Discord_User_ID", "姓名", "組別", "Item_ID", "購買數量", "單項總價", "匯款末五碼", "對帳狀態"])
+        orders_sheet.append_row(["Order_ID", "Discord_User_ID", "姓名", "組別", "Item_ID", "購買數量", "單項總價"])
 
         await channel.send(f"🔒 **本期牙材訂購已順利截止！**\n系統已成功產生歷史備份 `[{raw_sheet_name}]` 與結算報表 `[{settle_sheet_name}]`！\n**當期暫存工作區已全數清空重置**，下單通道關閉。")
         
@@ -261,7 +261,7 @@ class MultiOrderModal(Modal):
             total_cost += subtotal
             # 產生唯一訂單編號
             order_id = f"ORD-{uuid.uuid4().hex[:6].upper()}"
-            rows_to_add.append([order_id, str(interaction.user.id), mem['姓名'], mem['組別'], str(p['Item_ID']), qty, subtotal, "", "未匯款"])
+            rows_to_add.append([order_id, str(interaction.user.id), mem['姓名'], mem['組別'], str(p['Item_ID']), qty, subtotal])
             reply_msg += f"• {p['品項名稱']} x {qty} (小計: ${subtotal})\n"
 
         # 批次寫入 Google Sheets (效能更好)
@@ -476,17 +476,21 @@ async def report_payment(interaction: discord.Interaction, 末五碼: str):
         await interaction.followup.send("❌ 找不到當期的結算報表，請確認牙材長是否已經截止收單。", ephemeral=True)
         return
 
-    records = target_settle_sheet.get_all_records()
+    # 🚀 核心修正：結算表排版複雜，改用 get_all_values() 讀取純 2D 陣列，大幅提升速度並防止崩潰
+    all_values = target_settle_sheet.get_all_values()
     user_info = get_member_info(interaction.user.id)
     if not user_info:
         await interaction.followup.send("❌ 系統認不出您的 Discord 帳號，請先使用 `/綁定名冊`。", ephemeral=True)
         return
 
     updated = False
-    for idx, row in enumerate(records, start=5):
-        if row.get('同學姓名') == user_info['姓名']:
-            target_settle_sheet.update_cell(idx, 5, f"'{末五碼}") 
-            target_settle_sheet.update_cell(idx, 6, "已匯款待審核") 
+    for i, row in enumerate(all_values):
+        # 防呆：確保該列有足夠的長度，且第二欄(index 1)是該同學姓名
+        if len(row) >= 6 and str(row[1]).strip() == user_info['姓名']:
+            # 寫入資料：Google Sheet 列數從 1 開始，所以是 i + 1
+            row_idx = i + 1
+            target_settle_sheet.update_cell(row_idx, 5, f"'{末五碼}") 
+            target_settle_sheet.update_cell(row_idx, 6, "已匯款待審核") 
             updated = True
             break
             
@@ -499,7 +503,6 @@ async def report_payment(interaction: discord.Interaction, 末五碼: str):
 @bot.tree.command(name="組內對帳", description="【小組長專用】查看自己組內同學的繳費進度")
 async def group_check(interaction: discord.Interaction):
     leader = get_member_info(interaction.user.id)
-    # 支援「小組長1」、「小組長2」、「牙材長,小組長」等多重或帶數字的職位
     if not leader or "小組長" not in str(leader.get('職位', '')):
         await interaction.response.send_message("❌ 您非登記之小組長，權限不足！", ephemeral=True)
         return
@@ -510,17 +513,19 @@ async def group_check(interaction: discord.Interaction):
         await interaction.response.send_message("❌ 找不到當期結算報表。", ephemeral=True)
         return
 
-    records = target_settle_sheet.get_all_records()
+    # 🚀 核心修正：同樣改用快照掃描 get_all_values()
+    all_values = target_settle_sheet.get_all_values()
     embed = discord.Embed(title=f"📋 第 {leader['組別']} 組繳費對帳進度報告", color=0x9b59b6)
     
     found = False
-    for row in records:
-        if str(row.get('組別')) == f"第 {leader['組別']} 組":
+    for row in all_values:
+        # B區欄位對照 -> 0:組別, 1:姓名, 2:明細, 3:應匯款總額, 4:回報末五碼, 5:對帳狀態
+        if len(row) >= 6 and str(row[0]).strip() == f"第 {leader['組別']} 組":
             found = True
-            status_text = f"💰 應繳: ${row.get('應匯款總額', 0)} | 狀態: **{row.get('對帳狀態', '未知')}**"
-            if row.get('回報末五碼'):
-                status_text += f" (末五碼: {row['回報末五碼']})"
-            embed.add_field(name=f"👤 {row.get('同學姓名', '未知')}", value=status_text, inline=False)
+            status_text = f"💰 應繳: ${row[3]} | 狀態: **{row[5]}**"
+            if str(row[4]).strip():
+                status_text += f" (末五碼: {row[4]})"
+            embed.add_field(name=f"👤 {row[1]}", value=status_text, inline=False)
             
     if not found: embed.description = "本期本組無人需繳費。"
     await interaction.response.send_message(embed=embed, ephemeral=True)
@@ -529,7 +534,6 @@ async def group_check(interaction: discord.Interaction):
 @bot.tree.command(name="確認收妥", description="【小組長專用】核對網銀入帳後，變更同學狀態為已完款")
 async def confirm_payment(interaction: discord.Interaction, 同學姓名: str):
     leader = get_member_info(interaction.user.id)
-    # 支援「小組長1」、「小組長2」、「牙材長,小組長」等多重或帶數字的職位
     if not leader or "小組長" not in str(leader.get('職位', '')):
         await interaction.response.send_message("❌ 權限不足！", ephemeral=True)
         return
@@ -540,11 +544,12 @@ async def confirm_payment(interaction: discord.Interaction, 同學姓名: str):
         await interaction.response.send_message("❌ 找不到當期結算報表。", ephemeral=True)
         return
 
-    records = target_settle_sheet.get_all_records()
+    # 🚀 核心修正：同樣改用快照掃描 get_all_values()
+    all_values = target_settle_sheet.get_all_values()
     updated = False
-    for idx, row in enumerate(records, start=5):
-        if str(row.get('組別')) == f"第 {leader['組別']} 組" and str(row.get('同學姓名')) == 同學姓名:
-            target_settle_sheet.update_cell(idx, 6, "✅ 已收妥完款")
+    for i, row in enumerate(all_values):
+        if len(row) >= 6 and str(row[0]).strip() == f"第 {leader['組別']} 組" and str(row[1]).strip() == 同學姓名:
+            target_settle_sheet.update_cell(i + 1, 6, "✅ 已收妥完款")
             updated = True
             break
             
