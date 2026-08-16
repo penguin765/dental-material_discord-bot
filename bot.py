@@ -387,17 +387,26 @@ async def bind_name(interaction: discord.Interaction, 真實姓名: str):
 @bot.tree.command(name="開團訂購牙材", description="【牙材長專用】設定截止時間並開啟下單通道")
 async def start_group_buy(interaction: discord.Interaction, 截止時間: str):
     global IS_ORDER_OPEN, ANNOUNCEMENT_CHANNEL_ID
+    # 💡 增加 defer() 防止 Google Sheets 寫入超時導致機器人崩潰
+    await interaction.response.defer(ephemeral=True)
+    
     mem = get_member_info(interaction.user.id)
-    # 修正 1：利用 in 判斷，允許「牙材長,小組長」的雙重身分
-    if not mem or "牙材長" not in mem['職位']:
-        await interaction.response.send_message("❌ 您非牙材長，權限不足！", ephemeral=True)
+    if not mem or "牙材長" not in str(mem.get('職位', '')):
+        await interaction.followup.send("❌ 您非牙材長，權限不足！", ephemeral=True)
         return
+        
     try:
+        # 獨立抓取時間格式錯誤，精準報錯
         dt = datetime.datetime.strptime(截止時間, "%Y-%m-%d %H:%M")
-        if dt <= datetime.datetime.now():
-            await interaction.response.send_message("❌ 截止時間必須是未來的時間！", ephemeral=True)
-            return
+    except ValueError:
+        await interaction.followup.send(f"❌ 時間格式錯誤！請依照格式輸入：`2026-07-30 23:59`\n（您剛才輸入的是：`{截止時間}`）", ephemeral=True)
+        return
 
+    if dt <= datetime.datetime.now():
+        await interaction.followup.send("❌ 截止時間必須是未來的時間！", ephemeral=True)
+        return
+
+    try:
         IS_ORDER_OPEN = True
         ANNOUNCEMENT_CHANNEL_ID = interaction.channel_id
         scheduler.remove_all_jobs()
@@ -412,10 +421,35 @@ async def start_group_buy(interaction: discord.Interaction, 截止時間: str):
         update_sys_config("CLOSE_TIME", 截止時間)
         update_sys_config("ANNOUNCEMENT_CHANNEL_ID", str(interaction.channel_id))
 
-        await interaction.response.send_message(f"📢 **當期牙材訂購正式開跑！**\n系統將在 `{截止時間}` 自動截單並清空重置。")
-    except:
-        await interaction.response.send_message(f"❌ 時間格式錯誤！請依照格式輸入：`2026-07-30 23:59`", ephemeral=True)
+        await interaction.followup.send(f"📢 **當期牙材訂購正式開跑！**\n系統將在 `{截止時間}` 自動截單並清空重置。")
+    except Exception as e:
+        await interaction.followup.send(f"❌ 開團失敗，系統發生錯誤：`{e}`\n(請確認 Google Sheet 中是否有名為 System_Config 的分頁！)", ephemeral=True)
 
+
+@bot.tree.command(name="強制關團", description="【牙材長專用】立即關閉下單通道並產生結算報表")
+async def force_close_order(interaction: discord.Interaction):
+    global IS_ORDER_OPEN
+    mem = get_member_info(interaction.user.id)
+    if not mem or "牙材長" not in str(mem.get('職位', '')):
+        await interaction.response.send_message("❌ 您非牙材長，權限不足！", ephemeral=True)
+        return
+
+    if not IS_ORDER_OPEN:
+        await interaction.response.send_message("❌ 目前沒有正在進行中的團購，不需要關團！", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    try:
+        # 移除自動排程
+        scheduler.remove_all_jobs()
+        
+        # 💡 先回覆使用者，避免 auto_close_order 執行太久導致機器人 timeout
+        await interaction.followup.send("✅ 收到強制關團指令！正在處理結算報表，請稍候並留意頻道公告...", ephemeral=True)
+        
+        # 手動觸發截單程式
+        await auto_close_order()
+    except Exception as e:
+        await interaction.followup.send(f"❌ 強制關團時發生錯誤：{e}", ephemeral=True)
 
 @bot.tree.command(name="訂購牙材", description="挑選當期牙材並進行訂購（可一次勾選多項）")
 async def order_material(interaction: discord.Interaction):
