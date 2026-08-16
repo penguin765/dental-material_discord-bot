@@ -15,7 +15,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 app = Flask('')
 @app.route('/')
 def home():
-    return " 🤖逼哩逼哩🤖 \n  牙材訂購機器人一生懸命中！"
+    return " 🤖逼波逼波🤖 \n  牙材訂購機器人上工中！"
 
 def run_web_server():
     port = int(os.environ.get("PORT", 10000))
