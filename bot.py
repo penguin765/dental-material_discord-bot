@@ -469,11 +469,17 @@ async def my_orders(interaction: discord.Interaction):
 @bot.tree.command(name="回報匯款", description="【全班同學】匯款後回報您的帳戶末五碼")
 async def report_payment(interaction: discord.Interaction, 末五碼: str):
     await interaction.response.defer(ephemeral=True)
-    date_str = datetime.datetime.now().strftime("%m%d")
+    
+    # ✅ 修復重點：從 System_Config 取得最新的報表名稱，解決跨日找不到表單的問題
+    latest_sheet_name = get_sys_config("LATEST_SETTLEMENT_SHEET")
+    if not latest_sheet_name:
+        await interaction.followup.send("❌ 系統設定中找不到最新的結算表名稱，請確認牙材長是否已經產生過報表。", ephemeral=True)
+        return
+
     try:
-        target_settle_sheet = doc.worksheet(f"{date_str}牙材團購結算")
+        target_settle_sheet = doc.worksheet(latest_sheet_name)
     except:
-        await interaction.followup.send("❌ 找不到當期的結算報表，請確認牙材長是否已經截止收單。", ephemeral=True)
+        await interaction.followup.send(f"❌ 找不到結算報表 `[{latest_sheet_name}]`，可能已被刪除。", ephemeral=True)
         return
 
     # 🚀 核心修正：結算表排版複雜，改用 get_all_values() 讀取純 2D 陣列，大幅提升速度並防止崩潰
@@ -507,10 +513,15 @@ async def group_check(interaction: discord.Interaction):
         await interaction.response.send_message("❌ 您非登記之小組長，權限不足！", ephemeral=True)
         return
 
-    date_str = datetime.datetime.now().strftime("%m%d")
-    try: target_settle_sheet = doc.worksheet(f"{date_str}牙材團購結算")
+    # ✅ 修復重點：跨日對帳支援
+    latest_sheet_name = get_sys_config("LATEST_SETTLEMENT_SHEET")
+    if not latest_sheet_name:
+        await interaction.response.send_message("❌ 找不到最新的結算表，請確認是否已經截單。", ephemeral=True)
+        return
+
+    try: target_settle_sheet = doc.worksheet(latest_sheet_name)
     except:
-        await interaction.response.send_message("❌ 找不到當期結算報表。", ephemeral=True)
+        await interaction.response.send_message(f"❌ 找不到結算報表 `[{latest_sheet_name}]`。", ephemeral=True)
         return
 
     # 🚀 核心修正：同樣改用快照掃描 get_all_values()
@@ -538,10 +549,15 @@ async def confirm_payment(interaction: discord.Interaction, 同學姓名: str):
         await interaction.response.send_message("❌ 權限不足！", ephemeral=True)
         return
 
-    date_str = datetime.datetime.now().strftime("%m%d")
-    try: target_settle_sheet = doc.worksheet(f"{date_str}牙材團購結算")
+    # ✅ 修復重點：跨日對帳支援
+    latest_sheet_name = get_sys_config("LATEST_SETTLEMENT_SHEET")
+    if not latest_sheet_name:
+        await interaction.response.send_message("❌ 找不到最新的結算表，請確認是否已經截單。", ephemeral=True)
+        return
+
+    try: target_settle_sheet = doc.worksheet(latest_sheet_name)
     except:
-        await interaction.response.send_message("❌ 找不到當期結算報表。", ephemeral=True)
+        await interaction.response.send_message(f"❌ 找不到結算報表 `[{latest_sheet_name}]`。", ephemeral=True)
         return
 
     # 🚀 核心修正：同樣改用快照掃描 get_all_values()
