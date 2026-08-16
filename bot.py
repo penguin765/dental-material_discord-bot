@@ -538,7 +538,7 @@ async def modify_deadline(interaction: discord.Interaction, 新截止時間: str
         if ANNOUNCEMENT_CHANNEL_ID:
             channel = bot.get_channel(ANNOUNCEMENT_CHANNEL_ID)
             if channel:
-                await channel.send(f"📢 **【牙材長公告】截單時間已變更！**\n新的截單時間延長/縮短至 `{新截止時間}`，請大家留意下單時間！")
+                await channel.send(f"📢 **【牙材長公告】截單時間已變更！**\n新的截單時間變更至 `{新截止時間}`，請大家留意下單時間！")
                 
     except Exception as e:
         await interaction.followup.send(f"❌ 修改時間失敗，系統發生錯誤：`{e}`", ephemeral=True)
@@ -577,7 +577,9 @@ async def my_orders(interaction: discord.Interaction):
         if str(o.get('Discord_User_ID', '')) == str(interaction.user.id):
             o['品項名稱'] = prod_map.get(str(o['Item_ID']), "未知品項")
             user_orders.append(o)
-            total_cost += int(o['單項總價'])
+            try: cost = int(o.get('單項總價', 0) or 0)
+            except: cost = 0
+            total_cost += cost
 
     if not user_orders:
         await interaction.followup.send("🛒 您目前沒有任何訂購明細喔！", ephemeral=True)
@@ -591,6 +593,48 @@ async def my_orders(interaction: discord.Interaction):
     
     view = CancelOrderView(user_orders)
     await interaction.followup.send(embed=embed, view=view, ephemeral=True)
+
+@bot.tree.command(name="團購進度總覽", description="【全班通用】即時查看當期牙材的湊單進度與數量")
+async def progress_overview(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    
+    is_open_str = get_sys_config("IS_ORDER_OPEN")
+    if is_open_str != "True":
+        await interaction.followup.send("❌ 目前沒有正在進行的團購！", ephemeral=True)
+        return
+
+    try:
+        products = products_sheet.get_all_records()
+        summary = get_live_product_summary()
+        
+        embed = discord.Embed(title="📊 當期牙材湊單進度總覽", color=0x2ecc71)
+        text_content = ""
+        
+        for p in products:
+            item_id = str(p.get('Item_ID', ''))
+            name = p.get('品項名稱', '未知品項')
+            try: 
+                moq = int(p.get('最低購買量', 1) or 1)
+            except: 
+                moq = 1
+            
+            current_total = summary.get(item_id, 0)
+            
+            if moq <= 1:
+                text_content += f"🔹 **{name}**\n　 └ 已訂購: `{current_total}` 個\n\n"
+            else:
+                if current_total >= moq:
+                    text_content += f"✅ **{name}**\n　 └ 已達標: `{current_total} / {moq}` 個\n\n"
+                else:
+                    text_content += f"⚠️ **{name}**\n　 └ 湊單中: `{current_total} / {moq}` 個 (還差 {moq - current_total})\n\n"
+        
+        if not text_content:
+            text_content = "目前沒有任何牙材品項。"
+            
+        embed.description = text_content
+        await interaction.followup.send(embed=embed, ephemeral=True)
+    except Exception as e:
+        await interaction.followup.send(f"❌ 查詢失敗: {e}", ephemeral=True)
 
 @bot.tree.command(name="回報匯款", description="【全班同學】匯款後回報您的帳戶末五碼")
 async def report_payment(interaction: discord.Interaction, 末五碼: str):
@@ -623,34 +667,30 @@ async def report_payment(interaction: discord.Interaction, 末五碼: str):
             row_idx = i + 1
             target_settle_sheet.update_cell(row_idx, 5, f"'{末五碼}") 
             target_settle_sheet.update_cell(row_idx, 6, "已匯款待審核") 
-            updated = True
-            break
-            
-    if updated:
-        await interaction.followup.send(f"✅ 匯款回報成功！已在登記末五碼 `[{末五碼}]`，請等待小組長審核。", ephemeral=True)
-    else:
-        await interaction.followup.send("❌ 在本期結算名單中找不到您的應繳費紀錄。", ephemeral=True)
-
-
-@bot.tree.command(name="組內對帳", description="【小組長專用】查看自己組內同學的繳費進度")
-async def group_check(interaction: discord.Interaction):
+@bot.tree.command(name="組內對帳", description="【小組長專用】查看組內同學繳費進度（可跨組）")
+@app_commands.describe(指定組別="若要代班查看其他組別，請輸入組別數字 (可不填，預設為自己的組別)")
+async def group_check(interaction: discord.Interaction, 指定組別: int = None):
+    await interaction.response.defer(ephemeral=True)
     leader = get_member_info(interaction.user.id)
     if not leader or "小組長" not in str(leader.get('職位', '')):
-        await interaction.response.send_message("❌ 您非登記之小組長，權限不足！", ephemeral=True)
+        await interaction.followup.send("❌ 您非登記之小組長，權限不足！", ephemeral=True)
         return
+
+    # 若有填寫指定組別則用指定的，否則預設為自己所屬組別
+    target_group = f"第 {指定組別} 組" if 指定組別 is not None else f"第 {leader.get('組別', '')} 組"
 
     latest_sheet_name = get_sys_config("LATEST_SETTLEMENT_SHEET")
     if not latest_sheet_name:
-        await interaction.response.send_message("❌ 找不到最新的結算表，請確認是否已經截單。", ephemeral=True)
+        await interaction.followup.send("❌ 找不到最新的結算表，請確認是否已經截單。", ephemeral=True)
         return
 
     try: target_settle_sheet = doc.worksheet(latest_sheet_name)
     except:
-        await interaction.response.send_message(f"❌ 找不到結算報表 `[{latest_sheet_name}]`。", ephemeral=True)
+        await interaction.followup.send(f"❌ 找不到結算報表 `[{latest_sheet_name}]`。", ephemeral=True)
         return
 
     all_values = target_settle_sheet.get_all_values()
-    embed = discord.Embed(title=f"📋 第 {leader['組別']} 組繳費對帳進度報告", color=0x9b59b6)
+    embed = discord.Embed(title=f"📋 {target_group} 繳費對帳進度報告", color=0x9b59b6)
     
     found = False
     in_zone_b = False
@@ -658,50 +698,54 @@ async def group_check(interaction: discord.Interaction):
         if len(row) > 0 and "區塊 B" in str(row[0]):
             in_zone_b = True
             
-        if in_zone_b and len(row) >= 6 and str(row[0]).strip() == f"第 {leader['組別']} 組":
+        if in_zone_b and len(row) >= 6 and str(row[0]).strip() == target_group:
             found = True
             status_text = f"💰 應繳: ${row[3]} | 狀態: **{row[5]}**"
             if str(row[4]).strip():
                 status_text += f" (末五碼: {row[4]})"
             embed.add_field(name=f"👤 {row[1]}", value=status_text, inline=False)
             
-    if not found: embed.description = "本期本組無人需繳費。"
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+    if not found: embed.description = f"本期 {target_group} 無人需繳費，或查無此組資料。"
+    await interaction.followup.send(embed=embed, ephemeral=True)
 
 
-@bot.tree.command(name="確認收妥", description="【小組長專用】核對網銀入帳後，變更同學狀態為已完款")
-async def confirm_payment(interaction: discord.Interaction, 同學姓名: str):
+@bot.tree.command(name="確認收妥", description="【小組長專用】核對網銀入帳後，變更狀態為已完款（可跨組）")
+@app_commands.describe(同學姓名="請填寫同學真實姓名", 指定組別="若要代班確認其他組別，請填寫組別數字 (可不填，預設為自己的組)")
+async def confirm_payment(interaction: discord.Interaction, 同學姓名: str, 指定組別: int = None):
+    await interaction.response.defer(ephemeral=True)
     leader = get_member_info(interaction.user.id)
     if not leader or "小組長" not in str(leader.get('職位', '')):
-        await interaction.response.send_message("❌ 權限不足！", ephemeral=True)
+        await interaction.followup.send("❌ 權限不足！", ephemeral=True)
         return
+
+    target_group = f"第 {指定組別} 組" if 指定組別 is not None else f"第 {leader.get('組別', '')} 組"
 
     latest_sheet_name = get_sys_config("LATEST_SETTLEMENT_SHEET")
     if not latest_sheet_name:
-        await interaction.response.send_message("❌ 找不到最新的結算表，請確認是否已經截單。", ephemeral=True)
+        await interaction.followup.send("❌ 找不到最新的結算表，請確認是否已經截單。", ephemeral=True)
         return
 
     try: target_settle_sheet = doc.worksheet(latest_sheet_name)
     except:
-        await interaction.response.send_message(f"❌ 找不到結算報表 `[{latest_sheet_name}]`。", ephemeral=True)
+        await interaction.followup.send(f"❌ 找不到結算報表 `[{latest_sheet_name}]`。", ephemeral=True)
         return
 
     all_values = target_settle_sheet.get_all_values()
     updated = False
-    in_zone_b = False # ✅ 修復：強制等到進入區塊 B 才開始核對姓名
+    in_zone_b = False # 強制等到進入區塊 B 才開始核對姓名
     for i, row in enumerate(all_values):
         if len(row) > 0 and "區塊 B" in str(row[0]):
             in_zone_b = True
             
-        if in_zone_b and len(row) >= 6 and str(row[0]).strip() == f"第 {leader['組別']} 組" and str(row[1]).strip() == 同學姓名:
+        if in_zone_b and len(row) >= 6 and str(row[0]).strip() == target_group and str(row[1]).strip() == 同學姓名:
             target_settle_sheet.update_cell(i + 1, 6, "✅ 已收妥完款")
             updated = True
             break
             
     if updated:
-        await interaction.response.send_message(f"👍 已確認 **{同學姓名}** 款項入帳，狀態已更新！", ephemeral=True)
+        await interaction.followup.send(f"👍 已確認 **{target_group}** 的 **{同學姓名}** 款項入帳，狀態已更新！", ephemeral=True)
     else:
-        await interaction.response.send_message(f"❌ 在您的組內找不到名為 **{同學姓名}** 的繳費紀錄。", ephemeral=True)
+        await interaction.followup.send(f"❌ 在 **{target_group}** 找不到名為 **{同學姓名}** 的繳費紀錄。", ephemeral=True)
 
 # ================= 最底部啟動點 =================
 if __name__ == "__main__":
