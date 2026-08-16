@@ -407,6 +407,11 @@ async def start_group_buy(interaction: discord.Interaction, 截止時間: str):
         if reminder_time > datetime.datetime.now():
             scheduler.add_job(auto_reminder, 'date', run_date=reminder_time)
 
+        # 🚀 把開團狀態與時間存入 Google Sheet 中控台 (防重啟遺失)
+        update_sys_config("IS_ORDER_OPEN", "True")
+        update_sys_config("CLOSE_TIME", 截止時間)
+        update_sys_config("ANNOUNCEMENT_CHANNEL_ID", str(interaction.channel_id))
+
         await interaction.response.send_message(f"📢 **當期牙材訂購正式開跑！**\n系統將在 `{截止時間}` 自動截單並清空重置。")
     except:
         await interaction.response.send_message(f"❌ 時間格式錯誤！請依照格式輸入：`2026-07-30 23:59`", ephemeral=True)
