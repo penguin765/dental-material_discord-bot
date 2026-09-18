@@ -2,6 +2,7 @@ import os
 import json
 import datetime
 import uuid
+import asyncio
 from threading import Thread
 from flask import Flask
 import discord
@@ -50,28 +51,80 @@ except gspread.WorksheetNotFound:
     sys_sheet = doc.add_worksheet(title="System_Config", rows="50", cols="2")
     sys_sheet.append_row(["設定項目", "設定值"])
 
+# ─── 新增：全域快取 (Cache) 變數 ───
+CACHE = {
+    "members": [],
+    "products": [],
+    "sys_config": {}
+}
+
 IS_ORDER_OPEN = False
 ANNOUNCEMENT_CHANNEL_ID = None
 scheduler = AsyncIOScheduler(timezone="Asia/Taipei")
 
-# ================= 3. 輔助函式 (升級防呆版) =================
+# ================= 3. 輔助函式 (升級防呆與非同步版) =================
+
+async def reload_cache():
+    """在背景執行緒中重新載入靜態資料至記憶體"""
+    def _fetch():
+        m = members_sheet.get_all_records()
+        p = products_sheet.get_all_records()
+        c = sys_sheet.get_all_values()
+        
+        config_dict = {}
+        for row in c:
+            if len(row) >= 2:
+                config_dict[str(row[0]).strip()] = str(row[1]).strip()
+        
+        return m, p, config_dict
+
+    try:
+        m, p, c = await asyncio.to_thread(_fetch)
+        CACHE["members"] = m
+        CACHE["products"] = p
+        CACHE["sys_config"] = c
+        print("✅ 快取資料已成功更新。")
+    except Exception as e:
+        print(f"❌ 快取載入失敗: {e}")
 
 def get_member_info(user_id):
-    try:
-        search_str = str(user_id).strip()
-        all_members = members_sheet.get_all_records()
-        for row in all_members:
-            sheet_uid = str(row.get('Discord_User_ID', '')).strip()
-            if '.' in sheet_uid:
-                sheet_uid = sheet_uid.split('.')[0]
-            if sheet_uid == search_str:
-                return {"姓名": row.get("姓名"), "組別": row.get("組別"), "職位": str(row.get("職位", ""))}
-        return None
-    except:
-        return None
+    """直接從記憶體快取中尋找成員"""
+    search_str = str(user_id).strip()
+    for row in CACHE["members"]:
+        sheet_uid = str(row.get('Discord_User_ID', '')).strip()
+        if '.' in sheet_uid:
+            sheet_uid = sheet_uid.split('.')[0]
+        if sheet_uid == search_str:
+            return {"姓名": row.get("姓名"), "組別": row.get("組別"), "職位": str(row.get("職位", ""))}
+    return None
 
-def get_live_product_summary():
-    all_orders = orders_sheet.get_all_records()
+def get_sys_config(key):
+    """直接從記憶體快取讀取設定"""
+    return CACHE["sys_config"].get(key, None)
+
+async def update_sys_config(key, value):
+    """將設定寫入表單，並同步更新記憶體快取 (放入背景執行)"""
+    def _update():
+        all_values = sys_sheet.get_all_values()
+        for i, row in enumerate(all_values):
+            if len(row) > 0 and str(row[0]).strip() == key:
+                sys_sheet.update_cell(i + 1, 2, f"'{value}")
+                return
+        sys_sheet.append_row([key, f"'{value}"])
+        
+    await asyncio.to_thread(_update)
+    CACHE["sys_config"][key] = str(value) # 同步更新快取
+
+async def async_get_all_records(sheet):
+    """非同步讀取整個分頁記錄"""
+    return await asyncio.to_thread(sheet.get_all_records)
+
+async def async_get_all_values(sheet):
+     """非同步讀取整個分頁值"""
+     return await asyncio.to_thread(sheet.get_all_values)
+
+def compute_live_product_summary(all_orders):
+    """純計算，不再呼叫 API"""
     summary = {}
     for o in all_orders:
         item_id = str(o['Item_ID'])
@@ -82,26 +135,6 @@ def get_live_product_summary():
         summary[item_id] = summary.get(item_id, 0) + qty
     return summary
 
-def get_sys_config(key):
-    try:
-        all_values = sys_sheet.get_all_values()
-        for row in all_values:
-            if len(row) >= 2 and str(row[0]).strip() == key:
-                return str(row[1]).strip()
-    except:
-        pass
-    return None
-
-def update_sys_config(key, value):
-    try:
-        all_values = sys_sheet.get_all_values()
-        for i, row in enumerate(all_values):
-            if len(row) > 0 and str(row[0]).strip() == key:
-                sys_sheet.update_cell(i + 1, 2, f"'{value}")
-                return
-        sys_sheet.append_row([key, f"'{value}"])
-    except:
-        pass
 
 # ================= 4. 自動收單、歷史歸檔、重置工作區 =================
 
@@ -110,8 +143,11 @@ async def auto_reminder():
     channel = bot.get_channel(ANNOUNCEMENT_CHANNEL_ID)
     if not channel: return
 
-    products = products_sheet.get_all_records()
-    summary = get_live_product_summary()
+    products = CACHE["products"]
+    # 這裡必須即時讀取暫存區
+    all_orders = await async_get_all_records(orders_sheet)
+    summary = compute_live_product_summary(all_orders)
+    
     warning_text = ""
     for p in products:
         try: moq = int(p.get('最低購買量', 1) or 1)
@@ -127,6 +163,14 @@ async def auto_reminder():
         embed = discord.Embed(title="🚨 牙材訂購截止倒數：湊單未達標品項公告！", description=warning_text, color=0xe67e22)
         await channel.send(content=f"{ping_text} 湊單品項如果截止時未達標，該品項將整單取消喔！請大家幫忙補刀！", embed=embed)
 
+async def send_dm_task(user_id, embed):
+    """發送私訊的工作單元"""
+    try:
+        user = await bot.fetch_user(int(user_id))
+        await user.send(embed=embed)
+    except:
+        pass
+
 async def auto_close_order():
     global IS_ORDER_OPEN
     IS_ORDER_OPEN = False
@@ -135,37 +179,39 @@ async def auto_close_order():
     if not channel: return
 
     try:
-        all_orders = orders_sheet.get_all_records()
-        products = products_sheet.get_all_records()
+        # 非同步讀取
+        all_orders = await async_get_all_records(orders_sheet)
+        products = CACHE["products"]
         prod_map = {str(p['Item_ID']): p for p in products}
-        summary = get_live_product_summary()
+        summary = compute_live_product_summary(all_orders)
         date_str = datetime.datetime.now().strftime("%m%d")
 
         if not all_orders:
             await channel.send("🔒 本期訂購已截止，因無任何同學下單，系統不生成報表。")
-            update_sys_config("IS_ORDER_OPEN", "False")
+            await update_sys_config("IS_ORDER_OPEN", "False")
             return
 
         await channel.send("⏳ 正在產生歷史流水帳與結算報表，因資料量大可能需時數秒，請稍候...")
 
+        # ─── 歷史備份 ───
         raw_sheet_name = f"歷史_{date_str}原始明細"
-        try: doc.del_worksheet(doc.worksheet(raw_sheet_name))
-        except: pass
-        raw_ws = doc.add_worksheet(title=raw_sheet_name, rows="100", cols="10")
-        
-        raw_data = [["Order_ID", "Discord_User_ID", "姓名", "組別", "Item_ID", "購買數量", "單項總價"]]
-        for o in all_orders:
-            raw_data.append([o['Order_ID'], str(o['Discord_User_ID']), o['姓名'], o['組別'], str(o['Item_ID']), o['購買數量'], o['單項總價']])
-        raw_ws.append_rows(raw_data)
+        def _build_raw():
+            try: doc.del_worksheet(doc.worksheet(raw_sheet_name))
+            except: pass
+            raw_ws = doc.add_worksheet(title=raw_sheet_name, rows="100", cols="10")
+            raw_data = [["Order_ID", "Discord_User_ID", "姓名", "組別", "Item_ID", "購買數量", "單項總價"]]
+            for o in all_orders:
+                raw_data.append([o['Order_ID'], str(o['Discord_User_ID']), o['姓名'], o['組別'], str(o['Item_ID']), o['購買數量'], o['單項總價']])
+            raw_ws.append_rows(raw_data)
+        await asyncio.to_thread(_build_raw)
 
+        # ─── 結算報表 ───
         settle_sheet_name = f"{date_str}牙材團購結算"
-        try: doc.del_worksheet(doc.worksheet(settle_sheet_name))
-        except: pass
-        settle_ws = doc.add_worksheet(title=settle_sheet_name, rows="100", cols="10")
-
+        
+        # 記憶體內組裝結算資料
         settle_data = [] 
-
-        # ─── 區塊 A ───
+        
+        # 區塊 A
         settle_data.append(["【區塊 A：牙材長向廠商叫貨總表】"])
         settle_data.append(["品項 ID", "品項名稱", "全班叫貨總量", "單價", "總金額", "出貨狀態"])
         valid_items = set()
@@ -185,7 +231,7 @@ async def auto_close_order():
                 status = f"❌ 淘汰 (未滿最低購買量 {moq})"
             settle_data.append([item_id, p.get('品項名稱', '未知品項'), total_qty, price, total_qty * price, status])
 
-        # ─── 區塊 B ───
+        # 區塊 B
         settle_data.append([])
         settle_data.append(["【區塊 B：各小組分流對帳表】"])
         settle_data.append(["組別", "同學姓名", "訂購明細 (成功成團品項)", "應匯款總額", "回報末五碼", "對帳狀態"])
@@ -208,7 +254,7 @@ async def auto_close_order():
         for m in sorted_members:
             settle_data.append([f"第 {m['組別']} 組", m['姓名'], ", ".join(m['明細']), m['總價'], "", "未匯款"])
 
-        # ─── 區塊 C ───
+        # 區塊 C
         settle_data.append([])
         settle_data.append(["【區塊 C：各組上繳總表 (小組長向牙材長回報)】"])
         settle_data.append(["組別", "應上繳總額", "上繳末五碼", "牙材長確認狀態"])
@@ -218,7 +264,6 @@ async def auto_close_order():
             g_name = f"第 {data['組別']} 組"
             group_totals[g_name] = group_totals.get(g_name, 0) + data['總價']
         
-        # 將組別轉為數字進行合理排序
         def extract_num(s):
             nums = [int(s) for s in s.split() if s.isdigit()]
             return nums[0] if nums else 0
@@ -227,28 +272,34 @@ async def auto_close_order():
         for g_name in sorted_group_names:
             settle_data.append([g_name, group_totals[g_name], "", "未匯款"])
 
-        # 一次性寫入
-        settle_ws.append_rows(settle_data)
+        # 背景寫入結算報表與清空暫存
+        def _write_settle_and_clear():
+            try: doc.del_worksheet(doc.worksheet(settle_sheet_name))
+            except: pass
+            settle_ws = doc.add_worksheet(title=settle_sheet_name, rows="100", cols="10")
+            settle_ws.append_rows(settle_data)
+            orders_sheet.clear()
+            orders_sheet.append_row(["Order_ID", "Discord_User_ID", "姓名", "組別", "Item_ID", "購買數量", "單項總價"])
+        await asyncio.to_thread(_write_settle_and_clear)
 
-        # 清空暫存區
-        orders_sheet.clear()
-        orders_sheet.append_row(["Order_ID", "Discord_User_ID", "姓名", "組別", "Item_ID", "購買數量", "單項總價"])
-
-        update_sys_config("LATEST_SETTLEMENT_SHEET", settle_sheet_name)
-        update_sys_config("IS_ORDER_OPEN", "False")
-        update_sys_config("CLOSE_TIME", "")
+        await update_sys_config("LATEST_SETTLEMENT_SHEET", settle_sheet_name)
+        await update_sys_config("IS_ORDER_OPEN", "False")
+        await update_sys_config("CLOSE_TIME", "")
 
         await channel.send(f"🔒 **本期牙材訂購已順利截止！**\n系統已成功產生歷史備份 `[{raw_sheet_name}]` 與結算報表 `[{settle_sheet_name}]`！\n**當期暫存工作區已全數清空重置**，下單通道關閉。")
         
+        # ─── 高效併發發送私訊 ───
+        dm_tasks = []
         for user_id, data in group_billing.items():
-            try:
-                user = await bot.fetch_user(int(user_id))
-                embed = discord.Embed(title="🦷 您的當期牙材訂購個人帳單", color=0x3498db)
-                embed.add_field(name="訂購明細", value="\n".join(data["明細"]), inline=False)
-                embed.add_field(name="💰 應匯總金額", value=f"NT$ {data['總價']:,}", inline=False)
-                embed.set_footer(text="請匯款給您所屬的小組長後，使用 /回報匯款 登記末五碼。")
-                await user.send(embed=embed)
-            except: pass
+            embed = discord.Embed(title="🦷 您的當期牙材訂購個人帳單", color=0x3498db)
+            embed.add_field(name="訂購明細", value="\n".join(data["明細"]), inline=False)
+            embed.add_field(name="💰 應匯總金額", value=f"NT$ {data['總價']:,}", inline=False)
+            embed.set_footer(text="請匯款給您所屬的小組長後，使用 /回報匯款 登記末五碼。")
+            dm_tasks.append(send_dm_task(user_id, embed))
+            
+        if dm_tasks:
+             await asyncio.gather(*dm_tasks) # 同時發送
+
     except Exception as e:
         import traceback
         print(f"自動結算時發生崩潰:\n{traceback.format_exc()}")
@@ -298,13 +349,15 @@ class MultiOrderModal(Modal):
             rows_to_add.append([order_id, str(interaction.user.id), mem['姓名'], mem['組別'], str(p['Item_ID']), qty, subtotal])
             reply_msg += f"• {p['品項名稱']} x {qty} (小計: ${subtotal})\n"
 
-        orders_sheet.append_rows(rows_to_add)
+        # 背景寫入訂單
+        await asyncio.to_thread(orders_sheet.append_rows, rows_to_add)
+        
         reply_msg += f"\n**本次新增總金額：** NT$ {total_cost:,}\n*(可使用 `/我的訂單` 檢視或修改)*"
         await interaction.followup.send(reply_msg, ephemeral=True)
 
 class ProductSelect(Select):
-    def __init__(self, products):
-        summary = get_live_product_summary()
+    # 修改：不再在 __init__ 中抓資料，改由外部傳入 summary
+    def __init__(self, products, summary):
         options = []
         for p in products:
             item_id = str(p['Item_ID'])
@@ -343,23 +396,30 @@ class CancelOrderSelect(Select):
             return
         order_id_to_cancel = self.values[0]
         await interaction.response.defer(ephemeral=True)
+        
+        def _delete():
+             cell = orders_sheet.find(order_id_to_cancel, in_column=1)
+             orders_sheet.delete_rows(cell.row)
+             
         try:
-            cell = orders_sheet.find(order_id_to_cancel, in_column=1)
-            orders_sheet.delete_rows(cell.row)
+            # 背景執行刪除
+            await asyncio.to_thread(_delete)
             await interaction.followup.send("✅ 已成功取消該筆訂單！如需變更數量請重新使用 `/訂購牙材` 下單。", ephemeral=True)
         except gspread.CellNotFound:
             await interaction.followup.send("❌ 找不到該筆訂單，可能已經被取消了。", ephemeral=True)
+        except Exception as e:
+            await interaction.followup.send(f"❌ 取消時發生錯誤：{e}", ephemeral=True)
 
 class CancelOrderView(View):
     def __init__(self, user_orders):
         super().__init__(timeout=None)
         self.add_item(CancelOrderSelect(user_orders))
 
-# ─── 新增：小組長專用一鍵確認選單 ───
+# ─── 小組長專用一鍵確認選單 ───
 class GroupConfirmSelect(Select):
     def __init__(self, pending_members, sheet_name, target_group):
         options = []
-        for m in pending_members[:25]: # Discord選單最多25個選項
+        for m in pending_members[:25]:
             options.append(discord.SelectOption(label=m['姓名'], description=f"回報末五碼: {m['code']} | 應繳: ${m['amount']}", value=m['姓名']))
         super().__init__(placeholder="✅ 在此勾選已確認入帳的同學", min_values=1, max_values=len(options), options=options)
         self.sheet_name = sheet_name
@@ -367,32 +427,45 @@ class GroupConfirmSelect(Select):
 
     async def callback(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
-        target_settle_sheet = doc.worksheet(self.sheet_name)
-        records = target_settle_sheet.get_all_values()
         
-        updated_names = []
-        in_zone_b = False
-        for idx, row in enumerate(records, start=1):
-            title = str(row[0]).strip() if len(row) > 0 else ""
-            if "區塊 B" in title:
-                in_zone_b = True
-                continue
-            if "區塊 C" in title:
-                break # 區塊B結束
-                
-            if in_zone_b and len(row) >= 6:
-                if str(row[0]).strip() == self.target_group and str(row[1]).strip() in self.values:
-                    target_settle_sheet.update_cell(idx, 6, "✅ 已收妥完款")
-                    updated_names.append(str(row[1]).strip())
+        # 修改：批次更新寫入邏輯
+        def _batch_update():
+            target_settle_sheet = doc.worksheet(self.sheet_name)
+            records = target_settle_sheet.get_all_values()
+            
+            cells_to_update = []
+            updated_names = []
+            in_zone_b = False
+            
+            for idx, row in enumerate(records, start=1):
+                title = str(row[0]).strip() if len(row) > 0 else ""
+                if "區塊 B" in title:
+                    in_zone_b = True
+                    continue
+                if "區塊 C" in title:
+                    break 
                     
-        await interaction.followup.send(f"👍 已確認以下同學款項入帳，狀態更新完畢：\n**{', '.join(updated_names)}**", ephemeral=True)
+                if in_zone_b and len(row) >= 6:
+                    if str(row[0]).strip() == self.target_group and str(row[1]).strip() in self.values:
+                        cells_to_update.append(gspread.Cell(row=idx, col=6, value="✅ 已收妥完款"))
+                        updated_names.append(str(row[1]).strip())
+                        
+            if cells_to_update:
+                target_settle_sheet.update_cells(cells_to_update)
+            return updated_names
+            
+        try:
+             updated_names = await asyncio.to_thread(_batch_update)
+             await interaction.followup.send(f"👍 已確認以下同學款項入帳，狀態更新完畢：\n**{', '.join(updated_names)}**", ephemeral=True)
+        except Exception as e:
+             await interaction.followup.send(f"❌ 更新失敗：{e}", ephemeral=True)
 
 class GroupConfirmView(View):
     def __init__(self, pending_members, sheet_name, target_group):
         super().__init__(timeout=None)
         self.add_item(GroupConfirmSelect(pending_members, sheet_name, target_group))
 
-# ─── 新增：牙材長專用一鍵確認選單 ───
+# ─── 牙材長專用一鍵確認選單 ───
 class HeadConfirmSelect(Select):
     def __init__(self, pending_groups, sheet_name):
         options = []
@@ -403,28 +476,42 @@ class HeadConfirmSelect(Select):
 
     async def callback(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
-        target_settle_sheet = doc.worksheet(self.sheet_name)
-        records = target_settle_sheet.get_all_values()
         
-        updated_groups = []
-        in_zone_c = False
-        for idx, row in enumerate(records, start=1):
-            title = str(row[0]).strip() if len(row) > 0 else ""
-            if "區塊 C" in title:
-                in_zone_c = True
-                continue
-                
-            if in_zone_c and len(row) >= 4:
-                if str(row[0]).strip() in self.values:
-                    target_settle_sheet.update_cell(idx, 4, "✅ 已收妥完款")
-                    updated_groups.append(str(row[0]).strip())
+        # 修改：批次更新寫入邏輯
+        def _batch_update():
+            target_settle_sheet = doc.worksheet(self.sheet_name)
+            records = target_settle_sheet.get_all_values()
+            
+            cells_to_update = []
+            updated_groups = []
+            in_zone_c = False
+            
+            for idx, row in enumerate(records, start=1):
+                title = str(row[0]).strip() if len(row) > 0 else ""
+                if "區塊 C" in title:
+                    in_zone_c = True
+                    continue
                     
-        await interaction.followup.send(f"👑 已確認收到以下小組的帳款：\n**{', '.join(updated_groups)}**", ephemeral=True)
+                if in_zone_c and len(row) >= 4:
+                    if str(row[0]).strip() in self.values:
+                        cells_to_update.append(gspread.Cell(row=idx, col=4, value="✅ 已收妥完款"))
+                        updated_groups.append(str(row[0]).strip())
+                        
+            if cells_to_update:
+                target_settle_sheet.update_cells(cells_to_update)
+            return updated_groups
+            
+        try:
+            updated_groups = await asyncio.to_thread(_batch_update)
+            await interaction.followup.send(f"👑 已確認收到以下小組的帳款：\n**{', '.join(updated_groups)}**", ephemeral=True)
+        except Exception as e:
+            await interaction.followup.send(f"❌ 更新失敗：{e}", ephemeral=True)
 
 class HeadConfirmView(View):
     def __init__(self, pending_groups, sheet_name):
         super().__init__(timeout=None)
         self.add_item(HeadConfirmSelect(pending_groups, sheet_name))
+
 
 # ================= 6. 機器人核心指令群 =================
 class DentalERPBot(discord.Client):
@@ -433,6 +520,8 @@ class DentalERPBot(discord.Client):
         self.tree = app_commands.CommandTree(self)
         
     async def setup_hook(self):
+        # 啟動時預先載入快取
+        await reload_cache()
         scheduler.start()
         await self.tree.sync()
         print("✅ 指令樹同步完成。")
@@ -457,29 +546,52 @@ class DentalERPBot(discord.Client):
 
 bot = DentalERPBot()
 
+
+@bot.tree.command(name="刷新名冊與商品庫", description="【牙材長專用】手動重新從 Google Sheet 載入名冊與商品清單")
+async def force_reload_cache(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    mem = get_member_info(interaction.user.id)
+    if not mem or "牙材長" not in str(mem.get('職位', '')):
+        await interaction.followup.send("❌ 您非牙材長，權限不足！", ephemeral=True)
+        return
+    await reload_cache()
+    await interaction.followup.send("✅ 已成功從 Google Sheet 重新載入最新名冊與商品清單至記憶體！", ephemeral=True)
+
+
 @bot.tree.command(name="綁定名冊", description="【全班同學必用】首次使用時，綁定您的 Discord 帳號")
 async def bind_name(interaction: discord.Interaction, 真實姓名: str):
     await interaction.response.defer(ephemeral=True)
     try:
-        all_members = members_sheet.get_all_records()
+        # 直接拿快取資料判斷
+        all_members = CACHE["members"]
         user_id_str = str(interaction.user.id).strip()
         for row in all_members:
             sheet_uid = str(row.get('Discord_User_ID', '')).strip().split('.')[0]
             if sheet_uid == user_id_str:
                 await interaction.followup.send(f"❌ 您已綁定過姓名「{row.get('姓名')}」囉！若需更換請聯繫牙材長。", ephemeral=True)
                 return
+        
         updated = False
+        target_idx = -1
         for idx, row in enumerate(all_members, start=2):
             if str(row.get('姓名', '')).strip() == 真實姓名.strip():
                 current_bound_id = str(row.get('Discord_User_ID', '')).strip()
                 if current_bound_id and current_bound_id != "0" and current_bound_id != "":
                     await interaction.followup.send(f"❌ 「{真實姓名}」已經被其他帳號綁定了！", ephemeral=True)
                     return
-                members_sheet.update_cell(idx, 1, f"'{user_id_str}")
+                target_idx = idx
+                role = row.get('職位')
                 updated = True
-                await interaction.followup.send(f"🎉 綁定成功！**【{真實姓名}】** 歡迎！您的職位為 **[{row.get('職位')}]**。", ephemeral=True)
                 break
-        if not updated:
+                
+        if updated:
+            # 寫入背景化
+            def _update_bind():
+                members_sheet.update_cell(target_idx, 1, f"'{user_id_str}")
+            await asyncio.to_thread(_update_bind)
+            await reload_cache() # 綁定完刷新快取
+            await interaction.followup.send(f"🎉 綁定成功！**【{真實姓名}】** 歡迎！您的職位為 **[{role}]**。", ephemeral=True)
+        else:
             await interaction.followup.send(f"❌ 找不到名為「{真實姓名}」的同學，請確認是否有打錯字！", ephemeral=True)
     except Exception as e:
         await interaction.followup.send(f"❌ 綁定失敗，系統發生錯誤: {e}", ephemeral=True)
@@ -509,9 +621,9 @@ async def start_group_buy(interaction: discord.Interaction, 截止時間: str):
         if reminder_time > datetime.datetime.now():
             scheduler.add_job(auto_reminder, 'date', run_date=reminder_time)
 
-        update_sys_config("IS_ORDER_OPEN", "True")
-        update_sys_config("CLOSE_TIME", 截止時間)
-        update_sys_config("ANNOUNCEMENT_CHANNEL_ID", str(interaction.channel_id))
+        await update_sys_config("IS_ORDER_OPEN", "True")
+        await update_sys_config("CLOSE_TIME", 截止時間)
+        await update_sys_config("ANNOUNCEMENT_CHANNEL_ID", str(interaction.channel_id))
 
         target_role_id = get_sys_config("TARGET_ROLE_ID")
         ping_text = f"<@&{target_role_id}>\n" if target_role_id and target_role_id.strip() else ""
@@ -522,32 +634,35 @@ async def start_group_buy(interaction: discord.Interaction, 截止時間: str):
 @bot.tree.command(name="強制關團", description="【牙材長專用】立即關閉下單通道並產生結算報表")
 async def force_close_order(interaction: discord.Interaction):
     global IS_ORDER_OPEN
+    await interaction.response.defer(ephemeral=True)
     mem = get_member_info(interaction.user.id)
     if not mem or "牙材長" not in str(mem.get('職位', '')):
-        await interaction.response.send_message("❌ 您非牙材長，權限不足！", ephemeral=True)
+        await interaction.followup.send("❌ 您非牙材長，權限不足！", ephemeral=True)
         return
     if not IS_ORDER_OPEN:
-        await interaction.response.send_message("❌ 目前沒有正在進行中的團購，不需要關團！", ephemeral=True)
+        await interaction.followup.send("❌ 目前沒有正在進行中的團購，不需要關團！", ephemeral=True)
         return
-    await interaction.response.defer(ephemeral=True)
+    
     try:
         scheduler.remove_all_jobs()
         await interaction.followup.send("✅ 收到強制關團指令！正在處理結算報表，請稍候並留意頻道公告...", ephemeral=True)
-        await auto_close_order()
+        # 背景化處理
+        asyncio.create_task(auto_close_order())
     except Exception as e:
         await interaction.followup.send(f"❌ 強制關團時發生錯誤：{e}", ephemeral=True)
 
 @bot.tree.command(name="修改截止時間", description="【牙材長專用】修改當前團購的截止時間")
 async def modify_deadline(interaction: discord.Interaction, 新截止時間: str):
     global IS_ORDER_OPEN, ANNOUNCEMENT_CHANNEL_ID
+    await interaction.response.defer(ephemeral=True)
     mem = get_member_info(interaction.user.id)
     if not mem or "牙材長" not in str(mem.get('職位', '')):
-        await interaction.response.send_message("❌ 您非牙材長，權限不足！", ephemeral=True)
+        await interaction.followup.send("❌ 您非牙材長，權限不足！", ephemeral=True)
         return
     if not IS_ORDER_OPEN:
-        await interaction.response.send_message("❌ 目前沒有正在進行中的團購！", ephemeral=True)
+        await interaction.followup.send("❌ 目前沒有正在進行中的團購！", ephemeral=True)
         return
-    await interaction.response.defer(ephemeral=True)
+    
     try:
         dt = datetime.datetime.strptime(新截止時間, "%Y-%m-%d %H:%M")
     except ValueError:
@@ -562,7 +677,7 @@ async def modify_deadline(interaction: discord.Interaction, 新截止時間: str
         reminder_time = dt - datetime.timedelta(days=3)
         if reminder_time > datetime.datetime.now():
             scheduler.add_job(auto_reminder, 'date', run_date=reminder_time)
-        update_sys_config("CLOSE_TIME", 新截止時間)
+        await update_sys_config("CLOSE_TIME", 新截止時間)
         await interaction.followup.send(f"✅ 成功修改！新的截止時間為 `{新截止時間}`。", ephemeral=True)
         if ANNOUNCEMENT_CHANNEL_ID:
             channel = bot.get_channel(ANNOUNCEMENT_CHANNEL_ID)
@@ -581,8 +696,11 @@ async def progress_overview(interaction: discord.Interaction):
         await interaction.followup.send("❌ 目前沒有正在進行的團購！", ephemeral=True)
         return
     try:
-        products = products_sheet.get_all_records()
-        summary = get_live_product_summary()
+        # 改為非同步讀取
+        products = CACHE["products"]
+        all_orders = await async_get_all_records(orders_sheet)
+        summary = compute_live_product_summary(all_orders)
+        
         embed = discord.Embed(title="📊 當期牙材湊單進度總覽", color=0x2ecc71)
         text_content = ""
         for p in products:
@@ -605,47 +723,58 @@ async def progress_overview(interaction: discord.Interaction):
 
 @bot.tree.command(name="訂購牙材", description="挑選當期牙材並進行訂購（可一次勾選多項）")
 async def order_material(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True) # 立刻 defer 避免超時
     if not IS_ORDER_OPEN:
-        await interaction.response.send_message("❌ 目前非訂購期間，無法進行訂購！", ephemeral=True)
+        await interaction.followup.send("❌ 目前非訂購期間，無法進行訂購！", ephemeral=True)
         return
-    await interaction.response.defer(ephemeral=True)
+    
     try:
-        products = products_sheet.get_all_records()
+        # 背景化處理 API 請求
+        products = CACHE["products"]
+        all_orders = await async_get_all_records(orders_sheet)
+        summary = compute_live_product_summary(all_orders)
+
         view = View()
-        view.add_item(ProductSelect(products))
+        view.add_item(ProductSelect(products, summary))
         await interaction.followup.send("🦷 **請勾選欲訂購的品項：**\n*(註：單次最多只能同時結帳 5 項。若超過請分多次下單！)*", view=view, ephemeral=True)
     except Exception as e:
         await interaction.followup.send(f"❌ 讀取資料失敗，可能網路延遲過大。錯誤: {e}", ephemeral=True)
 
 @bot.tree.command(name="我的訂單", description="【個人專用】檢視自己目前的暫存訂單，可修改刪除")
 async def my_orders(interaction: discord.Interaction):
-    if not IS_ORDER_OPEN:
-        await interaction.response.send_message("🔒 目前非訂購期間，無法查看或修改暫存區！", ephemeral=True)
-        return
     await interaction.response.defer(ephemeral=True)
-    all_orders = orders_sheet.get_all_records()
-    products = products_sheet.get_all_records()
-    prod_map = {str(p['Item_ID']): p.get('品項名稱', '未知品項') for p in products}
-
-    user_orders = []
-    total_cost = 0
-    for o in all_orders:
-        if str(o.get('Discord_User_ID', '')) == str(interaction.user.id):
-            o['品項名稱'] = prod_map.get(str(o['Item_ID']), "未知品項")
-            user_orders.append(o)
-            try: cost = int(o.get('單項總價', 0) or 0)
-            except: cost = 0
-            total_cost += cost
-
-    if not user_orders:
-        await interaction.followup.send("🛒 您目前沒有任何訂購明細喔！", ephemeral=True)
+    if not IS_ORDER_OPEN:
+        await interaction.followup.send("🔒 目前非訂購期間，無法查看或修改暫存區！", ephemeral=True)
         return
-    embed = discord.Embed(title="🛒 您的當期購物車明細", description="以下是您目前預訂的品項（尚未截單）：", color=0x2ecc71)
-    for o in user_orders:
-        embed.add_field(name=o['品項名稱'], value=f"數量: {o.get('購買數量', 0)} | 小計: ${o.get('單項總價', 0)}", inline=False)
-    embed.add_field(name="💰 目前累積總額", value=f"**NT$ {total_cost:,}**", inline=False)
-    view = CancelOrderView(user_orders)
-    await interaction.followup.send(embed=embed, view=view, ephemeral=True)
+    
+    try:
+        # 非同步請求
+        all_orders = await async_get_all_records(orders_sheet)
+        products = CACHE["products"]
+        prod_map = {str(p['Item_ID']): p.get('品項名稱', '未知品項') for p in products}
+
+        user_orders = []
+        total_cost = 0
+        for o in all_orders:
+            if str(o.get('Discord_User_ID', '')) == str(interaction.user.id):
+                o['品項名稱'] = prod_map.get(str(o['Item_ID']), "未知品項")
+                user_orders.append(o)
+                try: cost = int(o.get('單項總價', 0) or 0)
+                except: cost = 0
+                total_cost += cost
+
+        if not user_orders:
+            await interaction.followup.send("🛒 您目前沒有任何訂購明細喔！", ephemeral=True)
+            return
+        embed = discord.Embed(title="🛒 您的當期購物車明細", description="以下是您目前預訂的品項（尚未截單）：", color=0x2ecc71)
+        for o in user_orders:
+            embed.add_field(name=o['品項名稱'], value=f"數量: {o.get('購買數量', 0)} | 小計: ${o.get('單項總價', 0)}", inline=False)
+        embed.add_field(name="💰 目前累積總額", value=f"**NT$ {total_cost:,}**", inline=False)
+        
+        view = CancelOrderView(user_orders)
+        await interaction.followup.send(embed=embed, view=view, ephemeral=True)
+    except Exception as e:
+        await interaction.followup.send(f"❌ 讀取訂單失敗：{e}", ephemeral=True)
 
 @bot.tree.command(name="回報匯款", description="【全班同學】匯款後回報您的帳戶末五碼")
 async def report_payment(interaction: discord.Interaction, 末五碼: str):
@@ -656,11 +785,11 @@ async def report_payment(interaction: discord.Interaction, 末五碼: str):
         return
     try:
         target_settle_sheet = doc.worksheet(latest_sheet_name)
+        all_values = await async_get_all_values(target_settle_sheet)
     except:
         await interaction.followup.send(f"❌ 找不到結算報表 `[{latest_sheet_name}]`。", ephemeral=True)
         return
 
-    all_values = target_settle_sheet.get_all_values()
     user_info = get_member_info(interaction.user.id)
     if not user_info:
         await interaction.followup.send("❌ 找不到您的名冊，請先使用 `/綁定名冊`。", ephemeral=True)
@@ -668,6 +797,7 @@ async def report_payment(interaction: discord.Interaction, 末五碼: str):
 
     updated = False
     in_zone_b = False 
+    target_idx = -1
     for i, row in enumerate(all_values):
         title = str(row[0]).strip() if len(row) > 0 else ""
         if "區塊 B" in title:
@@ -677,13 +807,15 @@ async def report_payment(interaction: discord.Interaction, 末五碼: str):
             break
             
         if in_zone_b and len(row) >= 6 and str(row[1]).strip() == user_info['姓名']:
-            row_idx = i + 1
-            target_settle_sheet.update_cell(row_idx, 5, f"'{末五碼}") 
-            target_settle_sheet.update_cell(row_idx, 6, "已匯款待審核") 
+            target_idx = i + 1
             updated = True
             break
             
     if updated:
+        def _update():
+            target_settle_sheet.update_cell(target_idx, 5, f"'{末五碼}") 
+            target_settle_sheet.update_cell(target_idx, 6, "已匯款待審核") 
+        await asyncio.to_thread(_update)
         await interaction.followup.send(f"✅ 匯款回報成功！已在結算單中登記末五碼 `[{末五碼}]`，請等待小組長審核。", ephemeral=True)
     else:
         await interaction.followup.send("❌ 找不到您的應繳費紀錄（可能您本期無下單或品項遭淘汰）。", ephemeral=True)
@@ -702,7 +834,7 @@ async def group_check(interaction: discord.Interaction, 指定組別: int = None
     try: 
         sheet_name = get_sys_config("LATEST_SETTLEMENT_SHEET")
         target_settle_sheet = doc.worksheet(sheet_name)
-        records = target_settle_sheet.get_all_values()
+        records = await async_get_all_values(target_settle_sheet)
     except:
         await interaction.followup.send("❌ 找不到當期結算報表。", ephemeral=True)
         return
@@ -761,13 +893,14 @@ async def report_group_payment(interaction: discord.Interaction, 末五碼: str,
 
     try:
         target_settle_sheet = doc.worksheet(latest_sheet_name)
-        records = target_settle_sheet.get_all_values()
+        records = await async_get_all_values(target_settle_sheet)
     except:
         await interaction.followup.send(f"❌ 讀取報表失敗。", ephemeral=True)
         return
 
     updated = False
     in_zone_c = False 
+    target_idx = -1
     for i, row in enumerate(records):
         title = str(row[0]).strip() if len(row) > 0 else ""
         if "區塊 C" in title:
@@ -775,13 +908,15 @@ async def report_group_payment(interaction: discord.Interaction, 末五碼: str,
             continue
             
         if in_zone_c and len(row) >= 4 and str(row[0]).strip() == target_group:
-            row_idx = i + 1
-            target_settle_sheet.update_cell(row_idx, 3, f"'{末五碼}") 
-            target_settle_sheet.update_cell(row_idx, 4, "已匯款待審核") 
+            target_idx = i + 1
             updated = True
             break
             
     if updated:
+        def _update():
+            target_settle_sheet.update_cell(target_idx, 3, f"'{末五碼}") 
+            target_settle_sheet.update_cell(target_idx, 4, "已匯款待審核") 
+        await asyncio.to_thread(_update)
         await interaction.followup.send(f"✅ 成功向牙材長回報！已登記 **{target_group}** 上繳末五碼 `[{末五碼}]`。", ephemeral=True)
     else:
         await interaction.followup.send(f"❌ 找不到 {target_group} 的應上繳紀錄（可能該組本期無人成團）。", ephemeral=True)
@@ -797,7 +932,7 @@ async def overall_check(interaction: discord.Interaction):
     try: 
         sheet_name = get_sys_config("LATEST_SETTLEMENT_SHEET")
         target_settle_sheet = doc.worksheet(sheet_name)
-        records = target_settle_sheet.get_all_values()
+        records = await async_get_all_values(target_settle_sheet)
     except:
         await interaction.followup.send("❌ 找不到當期結算報表。", ephemeral=True)
         return
