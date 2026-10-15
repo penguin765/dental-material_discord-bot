@@ -1424,7 +1424,7 @@ async def connection_watchdog():
 
 
 async def main_runner(token: str):
-    global BOT_LOGIN_STATUS
+    global BOT_LOGIN_STATUS, bot, DATA_READY
     watchdog = asyncio.create_task(connection_watchdog())
     try:
         while True:
@@ -1455,8 +1455,12 @@ async def main_runner(token: str):
                     bot.startup_task.cancel()
                     await asyncio.gather(bot.startup_task, return_exceptions=True)
                 await bot.close()
-                bot.clear()
+                # discord.py 2.7.1 clear() leaves a closed TCPConnector behind.
+                # Preserve command callbacks on a fresh client/HTTP pool instead.
+                previous = bot
+                DATA_READY = False
                 await asyncio.sleep(delay)
+                bot = replacement_client(previous)
     finally:
         watchdog.cancel()
         await asyncio.gather(watchdog, return_exceptions=True)
@@ -1464,6 +1468,14 @@ async def main_runner(token: str):
             bot.startup_task.cancel()
             await asyncio.gather(bot.startup_task, return_exceptions=True)
         await bot.close()
+
+
+def replacement_client(previous):
+    replacement = DentalERPBot()
+    for command in previous.tree.get_commands():
+        replacement.tree.add_command(command)
+    replacement.tree.on_error = previous.tree.on_error
+    return replacement
 
 
 if __name__ == "__main__":

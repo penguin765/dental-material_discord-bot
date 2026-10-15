@@ -3,6 +3,7 @@ import copy
 import json
 import threading
 import unittest
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import bot as app
@@ -43,6 +44,40 @@ class Doc:
 
 
 class BotTests(unittest.IsolatedAsyncioTestCase):
+    async def test_fresh_client_recovers_http_after_login_rate_limit(self):
+        # Real discord.py/aiohttp sessions and connectors; only HTTP I/O is mocked.
+        old = app.DentalERPBot()
+        for command in app.bot.tree.get_commands():
+            old.tree.add_command(command)
+        import aiohttp
+        sessions = []
+        real_session = aiohttp.ClientSession
+        def make_session(**kwargs):
+            session = real_session(**kwargs)
+            sessions.append(session)
+            return session
+        response = SimpleNamespace(status=429, reason='Too Many Requests')
+        async def rejected(*args, **kwargs):
+            raise app.discord.HTTPException(response, 'temporary limit')
+        with patch('discord.http.aiohttp.ClientSession', side_effect=make_session), \
+             patch.object(old.http, 'request', rejected):
+            with self.assertRaises(app.discord.HTTPException):
+                await old.http.static_login('offline-test-token')
+        await old.close()
+        self.assertTrue(sessions[0].closed)
+        fresh = app.replacement_client(old)
+        try:
+            with patch('discord.http.aiohttp.ClientSession', side_effect=make_session), \
+                 patch.object(fresh.http, 'request', AsyncMock(return_value={'id': '123'})):
+                result = await fresh.http.static_login('offline-test-token')
+            self.assertFalse(sessions[-1].closed)
+            self.assertEqual(result['id'], '123')
+            self.assertEqual(len(fresh.tree.get_commands()), len(old.tree.get_commands()))
+            self.assertFalse(fresh._initialized)
+            self.assertFalse(fresh.commands_ready)
+        finally:
+            await fresh.close()
+
     async def asyncSetUp(self):
         app.GS_LOCK = None
         app.SETTLEMENT_LOCK = None
