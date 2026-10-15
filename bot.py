@@ -1,4 +1,6 @@
 import os
+import sys
+import time
 import json
 import datetime
 import uuid
@@ -1265,62 +1267,35 @@ async def overall_check(interaction: discord.Interaction):
             await interaction.followup.send(embed=embed, ephemeral=True)
 
 
-# ================= 最底部啟動點 (防 429 崩潰與自動退避重連) =================
-async def start_bot_safely(token: str):
-    """
-    針對 Render 雲端環境設計的安全啟動器：
-    若遭遇 Discord 429 Too Many Requests，不會讓程式崩潰退出 (避免 Render 每 3 秒無限重啟加重封鎖)，
-    而是保持 Flask 服務運作，並自動進行指數退避冷卻後重連。
-    """
-    global BOT_LOGIN_STATUS
-    # 啟動時先在背景預載 Google Sheets 快取
-    asyncio.create_task(reload_cache())
-
-    retry_delay = 60  # 初次遇到 429 時等待 60 秒
-    while True:
-        try:
-            BOT_LOGIN_STATUS = "🟡 正在連線至 Discord..."
-            await bot.start(token)
-        except discord.errors.LoginFailure:
-            BOT_LOGIN_STATUS = "❌ DISCORD_BOT_TOKEN 無效，請檢查環境變數！"
-            print("❌ 嚴重錯誤：DISCORD_BOT_TOKEN 無效！請至 Render Environment 檢查。")
-            await asyncio.sleep(3600)
-        except discord.errors.HTTPException as e:
-            try:
-                await bot.http.close()
-            except Exception:
-                pass
-            if e.status == 429:
-                BOT_LOGIN_STATUS = f"🟠 遭遇 Discord 429 流量限制，冷卻等待中 ({retry_delay} 秒後自動重試)..."
-                print(
-                    f"⚠️ 遭遇 Discord 429 流量限制 (Render 共用 IP 暫時冷卻中)。\n"
-                    f"⏳ 系統將保持網頁開啟，並於 {retry_delay} 秒後自動重試登入，請勿手動頻繁重啟..."
-                )
-                await asyncio.sleep(retry_delay)
-                retry_delay = min(retry_delay * 2, 900)  # 每次加倍等待，最長 15 分鐘重試一次
-            else:
-                BOT_LOGIN_STATUS = f"🟠 Discord HTTP 異常 ({e.status})，30 秒後重試..."
-                print(f"⚠️ Discord HTTP 異常 ({e.status}): {e}，30 秒後重試...")
-                await asyncio.sleep(30)
-        except Exception as e:
-            try:
-                await bot.http.close()
-            except Exception:
-                pass
-            BOT_LOGIN_STATUS = f"🟠 連線異常 ({e})，30 秒後重試..."
-            print(f"⚠️ 未預期的連線異常：{e}，30 秒後重試...")
-            await asyncio.sleep(30)
-
+# ================= 最底部啟動點：Flask 背景守護 + 優雅冷卻重啟策略 =================
 if __name__ == "__main__":
     DISCORD_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
     print("🌐 正在啟動 Flask 背景網頁服務（Render 專用防休眠）...")
     keep_alive()
+
     if not DISCORD_TOKEN:
         BOT_LOGIN_STATUS = "❌ 未設定 DISCORD_BOT_TOKEN 環境變數"
         print("❌ 找不到 DISCORD_BOT_TOKEN 環境變數！")
         while True:
-            import time
             time.sleep(3600)
     else:
         print("🤖 正在連線至 Discord 核心伺服器...")
-        asyncio.run(start_bot_safely(DISCORD_TOKEN.strip()))
+        try:
+            BOT_LOGIN_STATUS = "🟡 正在連線至 Discord..."
+            bot.run(DISCORD_TOKEN.strip())
+        except Exception as e:
+            error_msg = str(e)
+            print(f"❌ 機器人啟動遭遇中斷: {error_msg}")
+
+            # 若遭遇 429 流量限制，先冷卻 60 秒再觸發重啟
+            if "429" in error_msg or "Too Many Requests" in error_msg:
+                BOT_LOGIN_STATUS = "🔴 遭受 Discord 429 流量限制，系統強制冷卻 60 秒中..."
+                print("⏳ 啟動強制冷卻機制：暫停 60 秒，避免被 Discord 持續封鎖...")
+                time.sleep(60)
+            else:
+                BOT_LOGIN_STATUS = f"🔴 連線失敗 ({error_msg})，系統 15 秒後自動重啟清理記憶體..."
+                print("⏳ 系統將在 15 秒後重啟清理環境...")
+                time.sleep(15)
+
+            # 強制退出程式，讓 Render 自動啟動一個 100% 乾淨的新程序（徹底避免 Session is closed）
+            sys.exit(1)
