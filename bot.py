@@ -16,6 +16,8 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 # ================= 0. 台灣時區與全域設定 =================
 TW_TZ = datetime.timezone(datetime.timedelta(hours=8))
+CMD_SYNC_VERSION = "2026.10.v1"  # 只有當此版本號改變時，啟動才會重新呼叫 tree.sync()
+BOT_LOGIN_STATUS = "🟡 啟動連線中..."
 
 def get_now_tw():
     """取得目前台灣時間（無時區標記，確保在 Render UTC 主機上時間精準）"""
@@ -26,7 +28,10 @@ app = Flask('')
 
 @app.route('/')
 def home():
-    bot_status = "🟢 已連線並就緒" if (bot and bot.is_ready()) else "🟡 啟動中或重新連線中"
+    if bot and bot.is_ready():
+        bot_status = f"🟢 已連線並就緒 ({bot.user})"
+    else:
+        bot_status = BOT_LOGIN_STATUS
     now_str = get_now_tw().strftime("%Y-%m-%d %H:%M:%S")
     return (
         f"🤖逼哩逼哩🤖 牙材訂購機器人一生懸命中！<br>"
@@ -54,10 +59,14 @@ members_sheet = None
 products_sheet = None
 orders_sheet = None
 sys_sheet = None
+GS_LOCK = None
 
-# 關鍵防護：gspread 底層的 requests.Session 並非執行緒安全 (Not Thread-Safe)
-# 使用非同步鎖確保背景執行緒不會同時讀寫同一個連線導致卡死
-GS_LOCK = asyncio.Lock()
+def get_gs_lock():
+    """延遲初始化 Lock，確保完全相容於 Python 3.14 的事件迴圈"""
+    global GS_LOCK
+    if GS_LOCK is None:
+        GS_LOCK = asyncio.Lock()
+    return GS_LOCK
 
 def _init_gsheets_sync():
     """同步建立或重連 Google Sheets"""
@@ -87,7 +96,8 @@ async def run_gsheet(func, *args, **kwargs):
     2. 加入 25 秒超時保護，避免網路卡死
     3. 若 Token 過期或連線中斷，自動重連並重試一次
     """
-    async with GS_LOCK:
+    lock = get_gs_lock()
+    async with lock:
         for attempt in range(2):
             try:
                 if doc is None:
@@ -125,7 +135,6 @@ async def reload_cache():
         o = orders_sheet.get_all_records()
         c = sys_sheet.get_all_values()
 
-        # 過濾掉空白列或重複 Item_ID，避免 Discord SelectOption 因空字串直接報錯 400
         valid_products = []
         seen_ids = set()
         for row in raw_p:
@@ -255,7 +264,6 @@ async def auto_close_order():
     channel = bot.get_channel(ANNOUNCEMENT_CHANNEL_ID) if ANNOUNCEMENT_CHANNEL_ID else None
 
     try:
-        # 截單時向 Google Sheet 拉取最準確的訂單紀錄
         all_orders = await run_gsheet(orders_sheet.get_all_records)
         CACHE["orders"] = all_orders
         products = CACHE["products"]
@@ -276,7 +284,6 @@ async def auto_close_order():
         raw_sheet_name = f"歷史_{date_str}原始明細"
         settle_sheet_name = f"{date_str}牙材團購結算"
 
-        # ─── 記憶體內組裝結算資料 ───
         settle_data = []
 
         # 區塊 A
@@ -348,9 +355,7 @@ async def auto_close_order():
         for g_name in sorted_group_names:
             settle_data.append([g_name, group_totals[g_name], "", "未匯款"])
 
-        # 一次性在背景完成歷史備份、結算表建立與清空暫存
         def _write_all_sheets():
-            # 1. 歷史明細
             try:
                 doc.del_worksheet(doc.worksheet(raw_sheet_name))
             except Exception:
@@ -365,7 +370,6 @@ async def auto_close_order():
                 ])
             raw_ws.append_rows(raw_data)
 
-            # 2. 結算表
             try:
                 doc.del_worksheet(doc.worksheet(settle_sheet_name))
             except Exception:
@@ -373,7 +377,6 @@ async def auto_close_order():
             settle_ws = doc.add_worksheet(title=settle_sheet_name, rows=str(max(100, len(settle_data) + 20)), cols="10")
             settle_ws.append_rows(settle_data)
 
-            # 3. 清空暫存訂單
             orders_sheet.clear()
             orders_sheet.append_row(["Order_ID", "Discord_User_ID", "姓名", "組別", "Item_ID", "購買數量", "單項總價"])
 
@@ -391,7 +394,6 @@ async def auto_close_order():
                 f"**當期暫存工作區已全數清空重置**，下單通道關閉。"
             )
 
-        # ─── 併發發送私訊 ───
         dm_tasks = []
         for user_id, data in group_billing.items():
             embed = discord.Embed(title="🦷 您的當期牙材訂購個人帳單", color=0x3498db)
@@ -422,7 +424,6 @@ class MultiOrderModal(Modal):
                 price = int(p.get('單價', 0) or 0)
             except Exception:
                 price = 0
-            # 防呆：Discord TextInput 的 label 嚴格限制最多 45 字元，超過會直接報錯未回應！
             raw_name = str(p.get('品項名稱', '未知')).strip()
             price_suffix = f" (${price})"
             max_name_len = 45 - len(price_suffix)
@@ -546,7 +547,6 @@ class CancelOrderSelect(Select):
         super().__init__(placeholder="❌ 若需修改，請選擇要「取消」的品項...", min_values=1, max_values=1, options=options)
 
     async def callback(self, interaction: discord.Interaction):
-        # 第一時間 defer，確保絕不超時
         await interaction.response.defer(ephemeral=True)
         if not IS_ORDER_OPEN:
             await interaction.followup.send("❌ 目前非訂購期間，無法修改訂單！", ephemeral=True)
@@ -708,19 +708,20 @@ class DentalERPBot(discord.Client):
         self._initialized = False
 
     async def setup_hook(self):
-        # 關鍵優化：不在 setup_hook 中阻塞等待 Google Sheets 與 sync，讓機器人秒速連上 Discord Gateway！
         if not scheduler.running:
             scheduler.start()
             scheduler.add_job(self_ping_render, 'interval', minutes=10, id='render_keep_alive', replace_existing=True)
 
     async def on_ready(self):
+        global BOT_LOGIN_STATUS
+        BOT_LOGIN_STATUS = f"🟢 已連線並就緒 ({self.user})"
         print(f"🤖 機器人已成功登入 Discord：{self.user} (ID: {self.user.id})")
         if not self._initialized:
             self._initialized = True
             asyncio.create_task(self._background_startup())
 
     async def _background_startup(self):
-        """背景完成快取載入、排程恢復與指令樹同步，絕不卡住主線程"""
+        """背景完成快取載入、排程恢復與智慧型指令樹同步"""
         print("⏳ 正在背景載入 Google Sheets 快取與恢復排程...")
         await reload_cache()
         try:
@@ -747,15 +748,20 @@ class DentalERPBot(discord.Client):
         except Exception as e:
             print(f"⚠️ 恢復開團狀態失敗：{e}")
 
+        # 智慧型指令樹同步：避免每次重啟都呼叫 tree.sync() 觸發 Discord 全域流量限制 (429)
         try:
-            await self.tree.sync()
-            print("✅ 斜線指令樹同步完成。")
+            synced_ver = get_sys_config("CMD_SYNC_VERSION")
+            if synced_ver != CMD_SYNC_VERSION:
+                await self.tree.sync()
+                await update_sys_config("CMD_SYNC_VERSION", CMD_SYNC_VERSION)
+                print(f"✅ 斜線指令樹同步完成 (版本: {CMD_SYNC_VERSION})。")
+            else:
+                print(f"ℹ️ 斜線指令樹已是最新版本 ({CMD_SYNC_VERSION})，略過重複同步以保護 API 額度。")
         except Exception as e:
             print(f"⚠️ 指令樹同步略過或受限：{e}")
 
 bot = DentalERPBot()
 
-# 全域斜線指令錯誤攔截器：確保任何未知錯誤都會回傳訊息，而不是顯示「應用程式未回應」
 @bot.tree.error
 async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
     print(f"❌ 指令執行錯誤 [{interaction.command}]:\n{traceback.format_exc()}")
@@ -979,7 +985,6 @@ async def progress_overview(interaction: discord.Interaction):
 
 @bot.tree.command(name="訂購牙材", description="挑選當期牙材並進行訂購（可一次勾選多項）")
 async def order_material(interaction: discord.Interaction):
-    # 第一時間 defer，完全使用記憶體快取回應，耗時 < 0.01 秒！
     await interaction.response.defer(ephemeral=True)
     if not IS_ORDER_OPEN and get_sys_config("IS_ORDER_OPEN") != "True":
         await interaction.followup.send("❌ 目前非訂購期間，無法進行訂購！", ephemeral=True)
@@ -992,7 +997,6 @@ async def order_material(interaction: discord.Interaction):
 
     summary = compute_live_product_summary(CACHE["orders"])
 
-    # 自動將超過 25 項的商品分區放入多個下拉選單 (最多支援 125 項商品不崩潰)
     chunks = [products[i:i + 25] for i in range(0, min(len(products), 125), 25)]
     view = View(timeout=300)
     for idx, chunk in enumerate(chunks):
@@ -1261,10 +1265,62 @@ async def overall_check(interaction: discord.Interaction):
             await interaction.followup.send(embed=embed, ephemeral=True)
 
 
-# ================= 最底部啟動點 =================
+# ================= 最底部啟動點 (防 429 崩潰與自動退避重連) =================
+async def start_bot_safely(token: str):
+    """
+    針對 Render 雲端環境設計的安全啟動器：
+    若遭遇 Discord 429 Too Many Requests，不會讓程式崩潰退出 (避免 Render 每 3 秒無限重啟加重封鎖)，
+    而是保持 Flask 服務運作，並自動進行指數退避冷卻後重連。
+    """
+    global BOT_LOGIN_STATUS
+    # 啟動時先在背景預載 Google Sheets 快取
+    asyncio.create_task(reload_cache())
+
+    retry_delay = 60  # 初次遇到 429 時等待 60 秒
+    while True:
+        try:
+            BOT_LOGIN_STATUS = "🟡 正在連線至 Discord..."
+            await bot.start(token)
+        except discord.errors.LoginFailure:
+            BOT_LOGIN_STATUS = "❌ DISCORD_BOT_TOKEN 無效，請檢查環境變數！"
+            print("❌ 嚴重錯誤：DISCORD_BOT_TOKEN 無效！請至 Render Environment 檢查。")
+            await asyncio.sleep(3600)
+        except discord.errors.HTTPException as e:
+            try:
+                await bot.http.close()
+            except Exception:
+                pass
+            if e.status == 429:
+                BOT_LOGIN_STATUS = f"🟠 遭遇 Discord 429 流量限制，冷卻等待中 ({retry_delay} 秒後自動重試)..."
+                print(
+                    f"⚠️ 遭遇 Discord 429 流量限制 (Render 共用 IP 暫時冷卻中)。\n"
+                    f"⏳ 系統將保持網頁開啟，並於 {retry_delay} 秒後自動重試登入，請勿手動頻繁重啟..."
+                )
+                await asyncio.sleep(retry_delay)
+                retry_delay = min(retry_delay * 2, 900)  # 每次加倍等待，最長 15 分鐘重試一次
+            else:
+                BOT_LOGIN_STATUS = f"🟠 Discord HTTP 異常 ({e.status})，30 秒後重試..."
+                print(f"⚠️ Discord HTTP 異常 ({e.status}): {e}，30 秒後重試...")
+                await asyncio.sleep(30)
+        except Exception as e:
+            try:
+                await bot.http.close()
+            except Exception:
+                pass
+            BOT_LOGIN_STATUS = f"🟠 連線異常 ({e})，30 秒後重試..."
+            print(f"⚠️ 未預期的連線異常：{e}，30 秒後重試...")
+            await asyncio.sleep(30)
+
 if __name__ == "__main__":
     DISCORD_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
     print("🌐 正在啟動 Flask 背景網頁服務（Render 專用防休眠）...")
     keep_alive()
-    print("🤖 正在連線至 Discord 核心伺服器...")
-    bot.run(DISCORD_TOKEN)
+    if not DISCORD_TOKEN:
+        BOT_LOGIN_STATUS = "❌ 未設定 DISCORD_BOT_TOKEN 環境變數"
+        print("❌ 找不到 DISCORD_BOT_TOKEN 環境變數！")
+        while True:
+            import time
+            time.sleep(3600)
+    else:
+        print("🤖 正在連線至 Discord 核心伺服器...")
+        asyncio.run(start_bot_safely(DISCORD_TOKEN.strip()))
