@@ -709,6 +709,17 @@ class DentalERPBot(discord.Client):
         self.tree = app_commands.CommandTree(self)
         self._initialized = False
 
+    def reset_client_state(self):
+        """徹底重置 discord.Client 內部狀態與連線池，避免 Session is closed"""
+        try:
+            self.clear()
+        except Exception:
+            pass
+        self._closed = False
+        if hasattr(self, "http") and self.http is not None:
+            self.http.connector = discord.utils.MISSING
+            self.http._HTTPClient__session = discord.utils.MISSING
+
     async def setup_hook(self):
         if not scheduler.running:
             scheduler.start()
@@ -1267,7 +1278,74 @@ async def overall_check(interaction: discord.Interaction):
             await interaction.followup.send(embed=embed, ephemeral=True)
 
 
-# ================= 最底部啟動點：Flask 背景守護 + 優雅冷卻重啟策略 =================
+# ================= 最底部啟動點：智慧讀取 Retry-After 與靜默冷卻機制 =================
+async def main_runner(token: str):
+    """
+    在單一程序中安全管理 Discord 連線：
+    1. 絕不呼叫 sys.exit(1)，確保 Render 顯示 'Your service is live' 不會被系統強制重啟
+    2. 遭遇 429 時自動解析 Discord 回傳的 Retry-After 秒數，進入完全靜默冷卻（預設至少 15 分鐘）
+    3. 重試前完整呼叫 bot.close() 與 reset_client_state()，徹底杜絕 Session is closed
+    """
+    global BOT_LOGIN_STATUS
+    attempt = 0
+
+    while True:
+        attempt += 1
+        try:
+            BOT_LOGIN_STATUS = f"🟡 正在嘗試連線至 Discord (第 {attempt} 次)..."
+            print(f"🤖 [第 {attempt} 次嘗試] 正在連線至 Discord 核心伺服器...")
+            await bot.start(token)
+        except discord.errors.HTTPException as e:
+            try:
+                await bot.close()
+            except Exception:
+                pass
+            bot.reset_client_state()
+
+            # 解析 Discord / Cloudflare 回傳的真實冷卻秒數
+            retry_after_header = None
+            if getattr(e, "response", None) and getattr(e.response, "headers", None):
+                retry_after_header = e.response.headers.get("Retry-After") or e.response.headers.get("retry-after")
+
+            if e.status == 429 or "429" in str(e):
+                if retry_after_header and str(retry_after_header).replace('.', '', 1).isdigit():
+                    # 依照 Discord 要求的秒數再加 30 秒安全緩衝，但最少冷卻 900 秒 (15 分鐘)
+                    wait_sec = max(int(float(retry_after_header)) + 30, 900)
+                else:
+                    # Cloudflare 1015 封鎖通常為 15 ~ 30 分鐘，不能每 60 秒敲一次（會重置封鎖計時器！）
+                    wait_sec = min(900 * attempt, 3600)
+
+                resume_time_str = (get_now_tw() + datetime.timedelta(seconds=wait_sec)).strftime("%H:%M:%S")
+                BOT_LOGIN_STATUS = (
+                    f"🔴 Render 共用 IP 遭 Discord 暫時限流 (429)，"
+                    f"靜默冷卻 {wait_sec // 60} 分鐘中（預計台灣時間 {resume_time_str} 自動重連）"
+                )
+                print(
+                    f"❌ 遭遇 Discord 429 全域限流 (Header Retry-After: {retry_after_header})。\n"
+                    f"⏳ 系統進入完全靜默冷卻 {wait_sec} 秒 ({wait_sec // 60} 分鐘)，"
+                    f"將於台灣時間 {resume_time_str} 自動重試，期間請勿手動重啟！"
+                )
+                await asyncio.sleep(wait_sec)
+            else:
+                wait_sec = 60
+                BOT_LOGIN_STATUS = f"🟠 HTTP 連線異常 ({e.status})，{wait_sec} 秒後自動重試..."
+                print(f"⚠️ Discord HTTP 異常: {e}，等待 {wait_sec} 秒後重試...")
+                await asyncio.sleep(wait_sec)
+
+        except Exception as e:
+            try:
+                await bot.close()
+            except Exception:
+                pass
+            bot.reset_client_state()
+
+            error_msg = str(e)
+            wait_sec = 30
+            BOT_LOGIN_STATUS = f"🟠 連線異常 ({error_msg})，{wait_sec} 秒後重試..."
+            print(f"❌ 未預期的連線異常: {error_msg}，等待 {wait_sec} 秒後重試...")
+            await asyncio.sleep(wait_sec)
+
+
 if __name__ == "__main__":
     DISCORD_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
     print("🌐 正在啟動 Flask 背景網頁服務（Render 專用防休眠）...")
@@ -1279,23 +1357,4 @@ if __name__ == "__main__":
         while True:
             time.sleep(3600)
     else:
-        print("🤖 正在連線至 Discord 核心伺服器...")
-        try:
-            BOT_LOGIN_STATUS = "🟡 正在連線至 Discord..."
-            bot.run(DISCORD_TOKEN.strip())
-        except Exception as e:
-            error_msg = str(e)
-            print(f"❌ 機器人啟動遭遇中斷: {error_msg}")
-
-            # 若遭遇 429 流量限制，先冷卻 60 秒再觸發重啟
-            if "429" in error_msg or "Too Many Requests" in error_msg:
-                BOT_LOGIN_STATUS = "🔴 遭受 Discord 429 流量限制，系統強制冷卻 60 秒中..."
-                print("⏳ 啟動強制冷卻機制：暫停 60 秒，避免被 Discord 持續封鎖...")
-                time.sleep(60)
-            else:
-                BOT_LOGIN_STATUS = f"🔴 連線失敗 ({error_msg})，系統 15 秒後自動重啟清理記憶體..."
-                print("⏳ 系統將在 15 秒後重啟清理環境...")
-                time.sleep(15)
-
-            # 強制退出程式，讓 Render 自動啟動一個 100% 乾淨的新程序（徹底避免 Session is closed）
-            sys.exit(1)
+        asyncio.run(main_runner(DISCORD_TOKEN.strip()))
