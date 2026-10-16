@@ -14,11 +14,13 @@ from flask import Flask
 import discord
 from discord_api import (
     API_HEALTH, safe_defer, safe_followup, safe_initial_reply, safe_modal,
-    handle_interaction_error, is_rate_limit, retry_seconds,
+    handle_interaction_error, is_rate_limit, retry_seconds, controlled_request,
+    http_trace, log_http_metrics, CooldownActive,
 )
 from discord import app_commands
 from discord.ui import View, Select, Modal, TextInput
 import gspread
+import notification_outbox as outbox
 from oauth2client.service_account import ServiceAccountCredentials
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
@@ -302,35 +304,69 @@ async def auto_reminder():
         embed = discord.Embed(title="🚨 牙材訂購截止倒數：湊單未達標品項公告！", description=warning_text[:4000], color=0xe67e22)
         await notify_channel(channel, content=f"{ping_text} 湊單品項如果截止時未達標，該品項將整單取消喔！請大家幫忙補刀！", embed=embed)
 
+OUTBOX_LOCK = None
+
+
 async def send_dm_task(user_id, embed):
-    """發送私訊的工作單元"""
-    if API_HEALTH.blocked():
-        logger.warning("Bill DM skipped during Discord HTTP cooldown")
+    # Each awaited step checks the circuit again. A 429 in another coroutine
+    # between fetch/create/send cannot let the next step leak through.
+    user = bot.get_user(int(user_id))
+    if user is None:
+        result = await controlled_request('bill_fetch_user',
+            lambda: bot.fetch_user(int(user_id)), background=True)
+        if result.state != 'success':
+            return result
+        user = result.value
+    channel = user.dm_channel
+    if channel is None:
+        result = await controlled_request('bill_create_dm', user.create_dm, background=True)
+        if result.state != 'success':
+            return result
+        channel = result.value
+    return await controlled_request('bill_send', lambda: channel.send(embed=embed), background=True)
+
+
+async def drain_outbox():
+    global OUTBOX_LOCK
+    if not DATA_READY or not bot.is_ready() or API_HEALTH.blocked():
         return
-    try:
-        user = await bot.fetch_user(int(user_id))
-        await user.send(embed=embed)
-    except discord.HTTPException as error:
-        if is_rate_limit(error):
-            API_HEALTH.fail(error, "bill_dm")
-        else:
-            logger.warning("Bill DM failed status=%s", error.status)
-    except Exception:
-        logger.warning("Could not deliver bill DM")
+    if OUTBOX_LOCK is None:
+        OUTBOX_LOCK = asyncio.Lock()
+    if OUTBOX_LOCK.locked():
+        return
+    async with OUTBOX_LOCK:
+        records = await run_gsheet(lambda: outbox.pending(doc))
+        for record in records[:5]:  # at most five invoices per 30s tick; bound Sheets writes too
+            if API_HEALTH.blocked() or not bot.is_ready():
+                break
+            key = record['delivery_id']
+            await run_gsheet(lambda: outbox.mark(doc, key, 'sending'))
+            try:
+                result = await send_dm_task(record['user_id'],
+                    discord.Embed.from_dict(json.loads(record['embed_json'])))
+                if result.state == 'success':
+                    status = 'sent'
+                elif result.state in ('cooldown', 'rate_limited'):
+                    status = 'pending'  # rejected / not sent: safe to resume later
+                elif result.state == 'http_error' and 400 <= result.status < 500:
+                    status = 'failed'  # closed DMs or permissions: never loop on 403
+                else:
+                    status = 'uncertain'
+                await run_gsheet(lambda: outbox.mark(doc, key, status, result.state))
+                logger.info('Invoice delivery status=%s', status)
+            except Exception as error:
+                # Leave 'sending' durable: next pass marks it uncertain, not sent again.
+                logger.warning('Invoice delivery interrupted error_type=%s', type(error).__name__)
+                break
 
 
 async def notify_channel(channel, *args, **kwargs):
-    if API_HEALTH.blocked():
-        logger.warning("Announcement skipped during Discord HTTP cooldown")
-        return None
-    try:
-        return await channel.send(*args, **kwargs)
-    except discord.HTTPException as error:
-        if is_rate_limit(error):
-            API_HEALTH.fail(error, "announcement")
-        else:
-            logger.warning("Announcement failed status=%s code=%s; accounting data is preserved",
-                           error.status, error.code)
+    result = await controlled_request('announcement',
+        lambda: channel.send(*args, **kwargs), background=True)
+    if result.state != 'success':
+        logger.warning('Announcement not delivered state=%s; accounting data preserved', result.state)
+    return result.value
+
 
 async def auto_close_order():
     global SETTLEMENT_LOCK
@@ -485,6 +521,17 @@ async def _settle_order():
             pending["stage"] = "ready"
             await update_sys_config("PENDING_SETTLEMENT", json.dumps(pending, ensure_ascii=False))
 
+        messages = []
+        for user_id, data in group_billing.items():
+            embed = discord.Embed(title="🦷 您的當期牙材訂購個人帳單", color=0x3498db)
+            detail_str = "\n".join(data["明細"])
+            embed.add_field(name="訂購明細", value=detail_str[:1020] if detail_str else "無", inline=False)
+            embed.add_field(name="💰 應匯總金額", value=f"NT$ {data['總價']:,}", inline=False)
+            embed.set_footer(text="請匯款給您所屬的小組長後，使用 /回報匯款 登記末五碼。")
+            messages.append((user_id, embed))
+
+        await run_gsheet(lambda: outbox.enqueue(doc, settle_sheet_name, messages))
+
         # Clear only after verified reports and durable recovery metadata exist.
         await update_sys_config("LATEST_SETTLEMENT_SHEET", settle_sheet_name)
         await update_sys_config("IS_ORDER_OPEN", "False")
@@ -500,17 +547,6 @@ async def _settle_order():
                 f"**當期暫存工作區已全數清空重置**，下單通道關閉。"
             )
 
-        dm_tasks = []
-        for user_id, data in group_billing.items():
-            embed = discord.Embed(title="🦷 您的當期牙材訂購個人帳單", color=0x3498db)
-            detail_str = "\n".join(data["明細"])
-            embed.add_field(name="訂購明細", value=detail_str[:1020] if detail_str else "無", inline=False)
-            embed.add_field(name="💰 應匯總金額", value=f"NT$ {data['總價']:,}", inline=False)
-            embed.set_footer(text="請匯款給您所屬的小組長後，使用 /回報匯款 登記末五碼。")
-            dm_tasks.append(send_dm_task(user_id, embed))
-
-        if dm_tasks:
-            await asyncio.gather(*dm_tasks)
 
     except Exception as e:
         print(f"自動結算時發生崩潰:\n{traceback.format_exc()}")
@@ -530,10 +566,9 @@ class ExpiringView(View):
         for child in self.children:
             child.disabled = True
         if self.message:
-            try:
-                await self.message.edit(content="⌛ 選單已過期，請重新執行斜線指令。", view=self)
-            except discord.HTTPException:
-                logger.info("Expired interaction message could not be edited")
+            await controlled_request('expired_view',
+                lambda: self.message.edit(content="⌛ 選單已過期，請重新執行斜線指令。", view=self),
+                background=True)
 
 
 async def send_view(interaction, view, **kwargs):
@@ -856,7 +891,7 @@ class ReadyCommandTree(app_commands.CommandTree):
 
 class DentalERPBot(discord.Client):
     def __init__(self):
-        super().__init__(intents=discord.Intents.default())
+        super().__init__(intents=discord.Intents.default(), http_trace=http_trace())
         self.tree = ReadyCommandTree(self)
         self._initialized = False
         self.commands_ready = False
@@ -868,6 +903,8 @@ class DentalERPBot(discord.Client):
             scheduler.start()
             scheduler.add_job(self_ping_render, 'interval', minutes=10,
                               id='render_keep_alive', replace_existing=True)
+            scheduler.add_job(drain_outbox, 'interval', seconds=30,
+                              id='invoice_outbox', replace_existing=True, max_instances=1, coalesce=True)
 
     async def on_ready(self):
         global BOT_LOGIN_STATUS
@@ -908,7 +945,10 @@ class DentalERPBot(discord.Client):
                 if not self.commands_ready:
                     key = f"CMD_SYNC_VERSION_{self.application_id}"
                     if get_sys_config(key) != CMD_SYNC_VERSION:
-                        await self.tree.sync()
+                        result = await controlled_request('command_sync', self.tree.sync, background=True)
+                        if result.state != 'success':
+                            await asyncio.sleep(max(30, API_HEALTH.snapshot()['retry_after_seconds']))
+                            continue
                         await update_sys_config(key, CMD_SYNC_VERSION)
                     self.commands_ready = True
                     logger.info("COMMANDS READY version=%s", CMD_SYNC_VERSION)
@@ -1464,6 +1504,7 @@ async def connection_watchdog():
         await asyncio.sleep(60)
         logger.info("Connection status: ready=%s closed=%s data=%s commands=%s",
                     bot.is_ready(), bot.is_closed(), DATA_READY, bot.commands_ready)
+        log_http_metrics()
 
 
 async def main_runner(token: str):
@@ -1489,6 +1530,8 @@ async def main_runner(token: str):
                 if is_rate_limit(error):
                     API_HEALTH.fail(error, "login")
                     delay = retry_seconds(error)
+                elif isinstance(error, CooldownActive):
+                    delay = max(1, API_HEALTH.snapshot()['retry_after_seconds'])
                 BOT_LOGIN_STATUS = f"🟠 連線失敗，{delay:.0f} 秒後重試"
                 logger.warning("Discord connection failed type=%s; retry in %.0fs", type(error).__name__, delay)
                 if bot.startup_task and not bot.startup_task.done():

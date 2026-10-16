@@ -80,6 +80,10 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
 
     async def asyncSetUp(self):
         app.API_HEALTH.reset()
+        import discord_api
+        discord_api.BACKGROUND_LOCK = None
+        discord_api.BACKGROUND_NEXT = 0
+        app.OUTBOX_LOCK = None
         app.GS_LOCK = None
         app.SETTLEMENT_LOCK = None
         app.DATA_READY = True
@@ -181,6 +185,17 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.orders.rows, original)
         self.assertEqual(self.orders.clear_count, 0)
         self.assertTrue(app.get_sys_config('PENDING_SETTLEMENT'))
+
+    async def test_outbox_failure_preserves_source_orders_and_recovery_checkpoint(self):
+        async def update(key, value):
+            app.CACHE['sys_config'][key] = str(value)
+        original = copy.deepcopy(self.orders.rows)
+        with patch.object(app, 'update_sys_config', update), \
+             patch.object(app.outbox, 'enqueue', side_effect=ConnectionError('write uncertain')):
+            await app.auto_close_order()
+        self.assertEqual(self.orders.rows, original)
+        self.assertEqual(self.orders.clear_count, 0)
+        self.assertEqual(json.loads(app.get_sys_config('PENDING_SETTLEMENT'))['stage'], 'ready')
 
     async def test_repeated_close_does_not_destroy_archive(self):
         async def update(key, value):

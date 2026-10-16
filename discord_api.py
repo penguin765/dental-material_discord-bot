@@ -6,8 +6,12 @@ import math
 import threading
 import time
 import traceback
+from collections import Counter
+from contextvars import ContextVar
+from dataclasses import dataclass
 from pathlib import Path
 
+import aiohttp
 import discord
 
 logger = logging.getLogger('dental_bot.api')
@@ -90,31 +94,127 @@ class APIHealth:
 API_HEALTH = APIHealth()
 
 
-async def _request(operation, factory, timeout):
-    if API_HEALTH.blocked():
-        logger.info('Discord HTTP suppressed operation=%s cooldown=%ss', operation,
-                    API_HEALTH.snapshot()['retry_after_seconds'])
-        return False, None
-    generation = API_HEALTH.begin()
-    try:
-        result = await asyncio.wait_for(factory(), timeout=timeout)
-    except discord.HTTPException as error:
-        if is_rate_limit(error):
+class CooldownActive(Exception):
+    """Raised before HTTP I/O; never includes request URLs or credentials."""
+
+
+OPERATION = ContextVar('discord_operation', default='client')
+METRICS = Counter()
+BACKGROUND_LOCK = None
+BACKGROUND_NEXT = 0
+INTERACTION_SLOTS = None
+
+
+def log_http_metrics():
+    # Event-loop only: no awaits while taking/resetting this interval's counters.
+    counts = dict(METRICS)
+    METRICS.clear()
+    logger.info('Discord HTTP metrics interval=60s counts=%s', counts)
+
+
+def http_trace():
+    """Count actual aiohttp attempts, including discord.py internal retries.
+
+    Only fixed operation names and HTTP statuses are retained, never URLs.
+    The start hook also blocks internal retries during a known cooldown.
+    """
+    trace = aiohttp.TraceConfig()
+
+    async def start(session, context, params):
+        if API_HEALTH.blocked():
+            METRICS['suppressed'] += 1
+            raise CooldownActive()
+        context.operation = OPERATION.get()
+        METRICS['attempts'] += 1
+        METRICS['operation:' + context.operation] += 1
+
+    async def end(session, context, params):
+        METRICS['status:' + str(params.response.status)] += 1
+        if params.response.status == 429:
+            # Headers arrive before discord.py's own retry loop. Open the
+            # circuit now so another coroutine cannot issue the next request.
+            error = discord.HTTPException(params.response, {'message': 'rate limited'})
+            API_HEALTH.fail(error, context.operation)
+
+    async def failed(session, context, params):
+        if not isinstance(params.exception, CooldownActive):
+            METRICS['transport_errors'] += 1
+
+    trace.on_request_start.append(start)
+    trace.on_request_end.append(end)
+    trace.on_request_exception.append(failed)
+    return trace
+
+
+@dataclass
+class RequestResult:
+    state: str
+    value: object = None
+    status: int = 0
+
+
+async def controlled_request(operation, factory, timeout=20, *, background=False):
+    """One logical operation; never replay writes. Background work is serial
+    and spaced by >=0.5s, leaving interaction acknowledgements independent.
+    This is an application traffic policy, not a hardcoded Discord limit.
+    """
+    global BACKGROUND_LOCK, BACKGROUND_NEXT
+    async def execute():
+        if API_HEALTH.blocked():
+            METRICS['suppressed'] += 1
+            return RequestResult('cooldown')
+        generation = API_HEALTH.begin()
+        token = OPERATION.set(operation)
+        METRICS['logical:' + operation] += 1
+        try:
+            value = await factory()
+            # Background successes must not claim that interactions work.
+            if not background:
+                API_HEALTH.success(generation)
+            logger.info('Discord HTTP succeeded operation=%s', operation)
+            return RequestResult('success', value)
+        except CooldownActive:
+            return RequestResult('cooldown')
+        except discord.HTTPException as error:
             API_HEALTH.fail(error, operation)
-            return False, None
-        # An expired interaction cannot be recovered by replying to it again.
-        if getattr(error, 'code', None) in (10062, 40060):
-            logger.warning('Interaction expired/already acknowledged operation=%s code=%s',
-                           operation, error.code)
-            return False, None
+            return RequestResult('rate_limited' if is_rate_limit(error) else 'http_error',
+                                 status=error.status)
+        except (TimeoutError, OSError) as error:
+            API_HEALTH.fail(error, operation)
+            return RequestResult('uncertain')
+        finally:
+            OPERATION.reset(token)
+
+    async def run():
+        global BACKGROUND_NEXT
+        if not background:
+            global INTERACTION_SLOTS
+            if INTERACTION_SLOTS is None:
+                INTERACTION_SLOTS = asyncio.Semaphore(4)
+            async with INTERACTION_SLOTS:
+                return await execute()  # includes queue time in interaction budget
+        global BACKGROUND_LOCK
+        if BACKGROUND_LOCK is None:
+            BACKGROUND_LOCK = asyncio.Lock()
+        async with BACKGROUND_LOCK:
+            delay = max(0, BACKGROUND_NEXT - time.monotonic())
+            if delay:
+                await asyncio.sleep(delay)
+            try:
+                return await execute()  # recheck after waiting for the slot
+            finally:
+                BACKGROUND_NEXT = time.monotonic() + 0.5
+
+    try:
+        return await asyncio.wait_for(run(), timeout)
+    except TimeoutError as error:
         API_HEALTH.fail(error, operation)
-        return False, None
-    except (TimeoutError, OSError) as error:
-        API_HEALTH.fail(error, operation)
-        return False, None
-    API_HEALTH.success(generation)
-    logger.info('Discord HTTP succeeded operation=%s', operation)
-    return True, result
+        return RequestResult('uncertain')
+
+
+async def _request(operation, factory, timeout):
+    result = await controlled_request(operation, factory, timeout)
+    return result.state == 'success', result.value
 
 
 def initial_budget(interaction):
