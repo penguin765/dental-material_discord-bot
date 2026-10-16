@@ -12,7 +12,7 @@ import urllib.request
 from threading import Thread
 from flask import Flask
 import discord
-from discord_api import (
+from .discord_api import (
     API_HEALTH, safe_defer, safe_followup, safe_initial_reply, safe_modal,
     handle_interaction_error, is_rate_limit, retry_seconds, controlled_request,
     http_trace, log_http_metrics, CooldownActive,
@@ -20,7 +20,7 @@ from discord_api import (
 from discord import app_commands
 from discord.ui import View, Select, Modal, TextInput
 import gspread
-import notification_outbox as outbox
+from . import notification_outbox as outbox
 from oauth2client.service_account import ServiceAccountCredentials
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 

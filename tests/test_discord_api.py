@@ -5,8 +5,8 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import discord
-import discord_api as api
-import bot
+from src import discord_api as api
+from src import bot
 
 
 def rate_error(headers=None):

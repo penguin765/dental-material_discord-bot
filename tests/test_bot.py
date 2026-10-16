@@ -6,7 +6,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
-import bot as app
+from src import bot as app
 
 
 class Sheet:
@@ -80,7 +80,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
 
     async def asyncSetUp(self):
         app.API_HEALTH.reset()
-        import discord_api
+        from src import discord_api
         discord_api.BACKGROUND_LOCK = None
         discord_api.BACKGROUND_NEXT = 0
         app.OUTBOX_LOCK = None
