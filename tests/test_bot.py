@@ -4,7 +4,7 @@ import json
 import threading
 import unittest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import bot as app
 
@@ -79,6 +79,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
             await fresh.close()
 
     async def asyncSetUp(self):
+        app.API_HEALTH.reset()
         app.GS_LOCK = None
         app.SETTLEMENT_LOCK = None
         app.DATA_READY = True
@@ -209,6 +210,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         app.CACHE['members'] = [{'姓名': 'Head', 'Discord_User_ID': '', '職位': '牙材長'}]
         interaction = AsyncMock()
         interaction.user.id = 123
+        interaction.response.is_done = Mock(return_value=False)
         with patch.object(app, 'run_gsheet', AsyncMock()) as writes:
             await app.bind_name.callback(interaction, 'Head')
         writes.assert_not_awaited()

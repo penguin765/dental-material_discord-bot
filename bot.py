@@ -12,6 +12,10 @@ import urllib.request
 from threading import Thread
 from flask import Flask
 import discord
+from discord_api import (
+    API_HEALTH, safe_defer, safe_followup, safe_initial_reply, safe_modal,
+    handle_interaction_error, is_rate_limit, retry_seconds,
+)
 from discord import app_commands
 from discord.ui import View, Select, Modal, TextInput
 import gspread
@@ -37,13 +41,21 @@ app = Flask('')
 @app.route('/')
 def home():
     if bot and bot.is_ready():
-        bot_status = f"🟢 已連線並就緒 ({bot.user})"
+        bot_status = f"🟢 Gateway 已連線 ({bot.user})"
     else:
         bot_status = BOT_LOGIN_STATUS
+    api = API_HEALTH.snapshot()
+    api_status = {
+        "not_tested": "尚未驗證互動回覆",
+        "verified": "最近一次互動回覆成功",
+        "awaiting_verification": "先前回覆失敗，等待新互動驗證",
+        "cooldown": f"Discord HTTP 限流冷卻中，剩餘約 {api['retry_after_seconds']} 秒；請勿連續重試",
+    }[api["state"]]
     now_str = get_now_tw().strftime("%Y-%m-%d %H:%M:%S")
     return (
         f"🤖逼哩逼哩🤖 牙材訂購機器人一生懸命中！<br>"
         f"📡 Discord 狀態：{bot_status}<br>"
+        f"📨 互動 API 狀態：{api_status}<br>"
         f"📚 資料狀態：{'就緒' if DATA_READY else '尚未就緒，請查看 Logs'}<br>"
         f"🕒 台灣時間：{now_str}<br>"
         f"📦 快取狀態：名冊 {len(CACHE['members'])} 人 | 商品 {len(CACHE['products'])} 項 | 暫存訂單 {len(CACHE['orders'])} 筆"
@@ -51,9 +63,11 @@ def home():
 
 @app.route('/readyz')
 def readiness():
-    ready = bot.is_ready() and DATA_READY and bot.commands_ready
+    api = API_HEALTH.snapshot()
+    ready = (bot.is_ready() and DATA_READY and bot.commands_ready
+             and api["state"] in ("not_tested", "verified"))
     return {"discord": bot.is_ready(), "data": DATA_READY,
-            "commands": bot.commands_ready}, 200 if ready else 503
+            "commands": bot.commands_ready, "interaction_api": api}, 200 if ready else 503
 
 
 def run_web_server():
@@ -208,7 +222,8 @@ def serialize_period_change(func):
     @wraps(func)
     async def wrapped(interaction, *args, **kwargs):
         global SETTLEMENT_LOCK
-        await interaction.response.defer(ephemeral=True)
+        if not await safe_defer(interaction):
+            return
         if SETTLEMENT_LOCK is None:
             SETTLEMENT_LOCK = asyncio.Lock()
         async with SETTLEMENT_LOCK:
@@ -285,22 +300,37 @@ async def auto_reminder():
         target_role_id = get_sys_config("TARGET_ROLE_ID")
         ping_text = f"<@&{target_role_id}>" if target_role_id and target_role_id.strip() else "【同學們】"
         embed = discord.Embed(title="🚨 牙材訂購截止倒數：湊單未達標品項公告！", description=warning_text[:4000], color=0xe67e22)
-        await channel.send(content=f"{ping_text} 湊單品項如果截止時未達標，該品項將整單取消喔！請大家幫忙補刀！", embed=embed)
+        await notify_channel(channel, content=f"{ping_text} 湊單品項如果截止時未達標，該品項將整單取消喔！請大家幫忙補刀！", embed=embed)
 
 async def send_dm_task(user_id, embed):
     """發送私訊的工作單元"""
+    if API_HEALTH.blocked():
+        logger.warning("Bill DM skipped during Discord HTTP cooldown")
+        return
     try:
         user = await bot.fetch_user(int(user_id))
         await user.send(embed=embed)
+    except discord.HTTPException as error:
+        if is_rate_limit(error):
+            API_HEALTH.fail(error, "bill_dm")
+        else:
+            logger.warning("Bill DM failed status=%s", error.status)
     except Exception:
-        logger.warning("Could not deliver bill DM to user_id=%s", user_id)
+        logger.warning("Could not deliver bill DM")
 
 
 async def notify_channel(channel, *args, **kwargs):
+    if API_HEALTH.blocked():
+        logger.warning("Announcement skipped during Discord HTTP cooldown")
+        return None
     try:
         return await channel.send(*args, **kwargs)
-    except discord.HTTPException:
-        logger.exception("Announcement failed; accounting data is preserved")
+    except discord.HTTPException as error:
+        if is_rate_limit(error):
+            API_HEALTH.fail(error, "announcement")
+        else:
+            logger.warning("Announcement failed status=%s code=%s; accounting data is preserved",
+                           error.status, error.code)
 
 async def auto_close_order():
     global SETTLEMENT_LOCK
@@ -493,6 +523,9 @@ async def _settle_order():
 class ExpiringView(View):
     message = None
 
+    async def on_error(self, interaction, error, item):
+        await handle_interaction_error(interaction, error)
+
     async def on_timeout(self):
         for child in self.children:
             child.disabled = True
@@ -504,7 +537,7 @@ class ExpiringView(View):
 
 
 async def send_view(interaction, view, **kwargs):
-    view.message = await interaction.followup.send(view=view, ephemeral=True, wait=True, **kwargs)
+    view.message = await safe_followup(interaction, view=view, ephemeral=True, wait=True, **kwargs)
 
 
 class MultiOrderModal(Modal):
@@ -528,13 +561,14 @@ class MultiOrderModal(Modal):
             self.inputs.append((p, inp))
 
     async def on_submit(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True)
+        if not await safe_defer(interaction):
+            return
         if not orders_open():
-            await interaction.followup.send("❌ 目前非訂購期間！", ephemeral=True)
+            await safe_followup(interaction, "❌ 目前非訂購期間！", ephemeral=True)
             return
         mem = get_member_info(interaction.user.id)
         if not mem:
-            await interaction.followup.send("❌ 找不到您的名冊紀錄！請先使用 `/綁定名冊`！", ephemeral=True)
+            await safe_followup(interaction, "❌ 找不到您的名冊紀錄！請先使用 `/綁定名冊`！", ephemeral=True)
             return
 
         rows_to_add = []
@@ -548,7 +582,7 @@ class MultiOrderModal(Modal):
                 if qty <= 0:
                     raise ValueError
             except ValueError:
-                await interaction.followup.send(f"❌ 數量輸入錯誤：**{p.get('品項名稱')}** 必須為大於 0 的正整數！", ephemeral=True)
+                await safe_followup(interaction, f"❌ 數量輸入錯誤：**{p.get('品項名稱')}** 必須為大於 0 的正整數！", ephemeral=True)
                 return
             try:
                 price = int(p.get('單價', 0) or 0)
@@ -584,15 +618,12 @@ class MultiOrderModal(Modal):
             known_ids = {str(o.get("Order_ID", "")) for o in CACHE["orders"]}
             CACHE["orders"].extend(o for o in cache_to_add if o["Order_ID"] not in known_ids)
             reply_msg += f"\n**本次新增總金額：** NT$ {total_cost:,}\n*(可使用 `/我的訂單` 檢視或修改)*"
-            await interaction.followup.send(reply_msg, ephemeral=True)
+            await safe_followup(interaction, reply_msg, ephemeral=True)
         except Exception as e:
-            await interaction.followup.send(f"⚠️ 訂單結果尚未確認，請牙材長刷新並核對訂單，勿立即重複下單。錯誤：{type(e).__name__}", ephemeral=True)
+            await safe_followup(interaction, f"⚠️ 訂單結果尚未確認，請牙材長刷新並核對訂單，勿立即重複下單。錯誤：{type(e).__name__}", ephemeral=True)
 
     async def on_error(self, interaction: discord.Interaction, error: Exception):
-        if not interaction.response.is_done():
-            await interaction.response.send_message(f"❌ 表單送出失敗：{error}", ephemeral=True)
-        else:
-            await interaction.followup.send(f"❌ 表單送出失敗：{error}", ephemeral=True)
+        await handle_interaction_error(interaction, error)
 
 
 class ProductSelect(Select):
@@ -631,7 +662,7 @@ class ProductSelect(Select):
 
     async def callback(self, interaction: discord.Interaction):
         selected_products = [p for p in self.products_chunk if str(p.get('Item_ID', '')).strip() in self.values]
-        await interaction.response.send_modal(MultiOrderModal(selected_products))
+        await safe_modal(interaction, MultiOrderModal(selected_products))
 
 
 class CancelOrderSelect(Select):
@@ -649,9 +680,10 @@ class CancelOrderSelect(Select):
         super().__init__(placeholder="❌ 若需修改，請選擇要「取消」的品項...", min_values=1, max_values=1, options=options)
 
     async def callback(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True)
+        if not await safe_defer(interaction):
+            return
         if not orders_open():
-            await interaction.followup.send("❌ 目前非訂購期間，無法修改訂單！", ephemeral=True)
+            await safe_followup(interaction, "❌ 目前非訂購期間，無法修改訂單！", ephemeral=True)
             return
         order_id_to_cancel = self.values[0]
 
@@ -668,11 +700,11 @@ class CancelOrderSelect(Select):
             deleted = await run_gsheet(_delete)
             CACHE["orders"] = [o for o in CACHE["orders"] if str(o.get("Order_ID", "")).strip() != order_id_to_cancel]
             if deleted:
-                await interaction.followup.send("✅ 已成功取消該筆訂單！如需變更數量請重新使用 `/訂購牙材` 下單。", ephemeral=True)
+                await safe_followup(interaction, "✅ 已成功取消該筆訂單！如需變更數量請重新使用 `/訂購牙材` 下單。", ephemeral=True)
             else:
-                await interaction.followup.send("❌ 找不到該筆訂單，可能已經被取消了。", ephemeral=True)
+                await safe_followup(interaction, "❌ 找不到該筆訂單，可能已經被取消了。", ephemeral=True)
         except Exception as e:
-            await interaction.followup.send(f"❌ 取消時發生錯誤：{e}", ephemeral=True)
+            await safe_followup(interaction, f"❌ 取消時發生錯誤：{e}", ephemeral=True)
 
 
 class CancelOrderView(ExpiringView):
@@ -701,7 +733,8 @@ class GroupConfirmSelect(Select):
         self.target_group = target_group
 
     async def callback(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True)
+        if not await safe_defer(interaction):
+            return
 
         def _batch_update():
             target_settle_sheet = doc.worksheet(self.sheet_name)
@@ -731,11 +764,11 @@ class GroupConfirmSelect(Select):
         try:
             updated_names = await run_gsheet(_batch_update)
             if updated_names:
-                await interaction.followup.send(f"👍 已確認以下同學款項入帳，狀態更新完畢：\n**{', '.join(updated_names)}**", ephemeral=True)
+                await safe_followup(interaction, f"👍 已確認以下同學款項入帳，狀態更新完畢：\n**{', '.join(updated_names)}**", ephemeral=True)
             else:
-                await interaction.followup.send("⚠️ 未找到符合的待審核紀錄。", ephemeral=True)
+                await safe_followup(interaction, "⚠️ 未找到符合的待審核紀錄。", ephemeral=True)
         except Exception as e:
-            await interaction.followup.send(f"❌ 更新失敗：{e}", ephemeral=True)
+            await safe_followup(interaction, f"❌ 更新失敗：{e}", ephemeral=True)
 
 
 class GroupConfirmView(ExpiringView):
@@ -763,7 +796,8 @@ class HeadConfirmSelect(Select):
         self.sheet_name = sheet_name
 
     async def callback(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True)
+        if not await safe_defer(interaction):
+            return
 
         def _batch_update():
             target_settle_sheet = doc.worksheet(self.sheet_name)
@@ -791,11 +825,11 @@ class HeadConfirmSelect(Select):
         try:
             updated_groups = await run_gsheet(_batch_update)
             if updated_groups:
-                await interaction.followup.send(f"👑 已確認收到以下小組的帳款：\n**{', '.join(updated_groups)}**", ephemeral=True)
+                await safe_followup(interaction, f"👑 已確認收到以下小組的帳款：\n**{', '.join(updated_groups)}**", ephemeral=True)
             else:
-                await interaction.followup.send("⚠️ 未找到符合的小組紀錄。", ephemeral=True)
+                await safe_followup(interaction, "⚠️ 未找到符合的小組紀錄。", ephemeral=True)
         except Exception as e:
-            await interaction.followup.send(f"❌ 更新失敗：{e}", ephemeral=True)
+            await safe_followup(interaction, f"❌ 更新失敗：{e}", ephemeral=True)
 
 
 class HeadConfirmView(ExpiringView):
@@ -807,11 +841,14 @@ class HeadConfirmView(ExpiringView):
 # ================= 6. 機器人核心與非阻塞啟動流程 =================
 class ReadyCommandTree(app_commands.CommandTree):
     async def interaction_check(self, interaction):
+        if API_HEALTH.blocked():
+            logger.info("Command suppressed during HTTP cooldown interaction_id=%s", interaction.id)
+            return False
         if interaction.command and interaction.command.name == "刷新名冊與商品庫":
             return True
         if DATA_READY and self.client._initialized:
             return True
-        await interaction.response.send_message(
+        await safe_initial_reply(interaction,
             "⏳ 資料服務仍在初始化或重試，請稍後再試；管理員請查看 Render Logs。",
             ephemeral=True)
         return False
@@ -876,38 +913,35 @@ class DentalERPBot(discord.Client):
                     self.commands_ready = True
                     logger.info("COMMANDS READY version=%s", CMD_SYNC_VERSION)
                 return
-            except Exception:
-                logger.exception("Startup incomplete; retrying in 30 seconds")
-                await asyncio.sleep(30)
+            except Exception as error:
+                delay = 30
+                if is_rate_limit(error):
+                    API_HEALTH.fail(error, "command_sync")
+                    delay = retry_seconds(error)
+                logger.warning("Startup incomplete type=%s; retrying in %.0fs", type(error).__name__, delay)
+                await asyncio.sleep(delay)
 
 
 bot = DentalERPBot()
 
 @bot.tree.error
 async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
-    print(f"❌ 指令執行錯誤 [{interaction.command}]:\n{traceback.format_exc()}")
-    err_msg = f"❌ 執行指令時發生異常：`{error}`\n請稍後再試，或請牙材長執行 `/刷新名冊與商品庫`。"
-    try:
-        if not interaction.response.is_done():
-            await interaction.response.send_message(err_msg, ephemeral=True)
-        else:
-            await interaction.followup.send(err_msg, ephemeral=True)
-    except Exception:
-        pass
+    await handle_interaction_error(interaction, error)
 
 
 @bot.tree.command(name="刷新名冊與商品庫", description="【牙材長專用】手動重新從 Google Sheet 載入名冊、商品與訂單快取")
 async def force_reload_cache(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True)
+    if not await safe_defer(interaction):
+        return
     if not CACHE["members"]:
         await reload_cache()
     mem = get_member_info(interaction.user.id)
     if not mem or "牙材長" not in str(mem.get('職位', '')):
-        await interaction.followup.send("❌ 您非牙材長，權限不足！", ephemeral=True)
+        await safe_followup(interaction, "❌ 您非牙材長，權限不足！", ephemeral=True)
         return
     ok = await reload_cache()
     if ok:
-        await interaction.followup.send(
+        await safe_followup(interaction,
             f"✅ 已成功從 Google Sheet 重新載入最新快取！\n"
             f"• 名冊人數：`{len(CACHE['members'])}` 人\n"
             f"• 有效商品：`{len(CACHE['products'])}` 項\n"
@@ -915,12 +949,13 @@ async def force_reload_cache(interaction: discord.Interaction):
             ephemeral=True
         )
     else:
-        await interaction.followup.send("❌ 載入快取失敗，請檢查 Google Sheet 連線狀態。", ephemeral=True)
+        await safe_followup(interaction, "❌ 載入快取失敗，請檢查 Google Sheet 連線狀態。", ephemeral=True)
 
 
 @bot.tree.command(name="綁定名冊", description="【全班同學必用】首次使用時，綁定您的 Discord 帳號")
 async def bind_name(interaction: discord.Interaction, 真實姓名: str):
-    await interaction.response.defer(ephemeral=True)
+    if not await safe_defer(interaction):
+        return
     if not CACHE["members"]:
         await reload_cache()
 
@@ -929,30 +964,30 @@ async def bind_name(interaction: discord.Interaction, 真實姓名: str):
     for row in all_members:
         sheet_uid = str(row.get('Discord_User_ID', '')).strip().lstrip("'").split('.')[0]
         if sheet_uid == user_id_str:
-            await interaction.followup.send(f"❌ 您已綁定過姓名「{row.get('姓名')}」囉！若需更換請聯繫牙材長。", ephemeral=True)
+            await safe_followup(interaction, f"❌ 您已綁定過姓名「{row.get('姓名')}」囉！若需更換請聯繫牙材長。", ephemeral=True)
             return
 
     target_name = 真實姓名.strip()
     if sum(str(row.get('姓名', '')).strip() == target_name for row in all_members) > 1:
-        await interaction.followup.send("❌ 名冊有同名資料，請管理員先使用唯一姓名識別，再綁定。", ephemeral=True)
+        await safe_followup(interaction, "❌ 名冊有同名資料，請管理員先使用唯一姓名識別，再綁定。", ephemeral=True)
         return
     found_row = None
     for row in all_members:
         if str(row.get('姓名', '')).strip() == target_name:
             current_bound_id = str(row.get('Discord_User_ID', '')).strip().lstrip("'")
             if current_bound_id and current_bound_id != "0":
-                await interaction.followup.send(f"❌ 「{target_name}」已經被其他帳號綁定了！", ephemeral=True)
+                await safe_followup(interaction, f"❌ 「{target_name}」已經被其他帳號綁定了！", ephemeral=True)
                 return
             found_row = row
             break
 
     if not found_row:
-        await interaction.followup.send(f"❌ 找不到名為「{target_name}」的同學，請確認是否有打錯字！", ephemeral=True)
+        await safe_followup(interaction, f"❌ 找不到名為「{target_name}」的同學，請確認是否有打錯字！", ephemeral=True)
         return
 
     role = str(found_row.get('職位', ''))
     if '牙材長' in role or '小組長' in role:
-        await interaction.followup.send(
+        await safe_followup(interaction,
             "❌ 管理職位須由管理員在 Members 表預先填入 Discord_User_ID，不能只靠姓名自行認領。",
             ephemeral=True)
         return
@@ -972,9 +1007,9 @@ async def bind_name(interaction: discord.Interaction, 真實姓名: str):
     if ok:
         found_row['Discord_User_ID'] = user_id_str
         role = found_row.get('職位', '一般')
-        await interaction.followup.send(f"🎉 綁定成功！**【{target_name}】** 歡迎！您的職位為 **[{role}]**。", ephemeral=True)
+        await safe_followup(interaction, f"🎉 綁定成功！**【{target_name}】** 歡迎！您的職位為 **[{role}]**。", ephemeral=True)
     else:
-        await interaction.followup.send("❌ 寫入名冊失敗，請稍後再試。", ephemeral=True)
+        await safe_followup(interaction, "❌ 寫入名冊失敗，請稍後再試。", ephemeral=True)
 
 
 @bot.tree.command(name="開團訂購牙材", description="【牙材長專用】設定截止時間並開啟下單通道")
@@ -983,27 +1018,27 @@ async def start_group_buy(interaction: discord.Interaction, 截止時間: str):
     global IS_ORDER_OPEN, ANNOUNCEMENT_CHANNEL_ID
     mem = get_member_info(interaction.user.id)
     if not mem or "牙材長" not in str(mem.get('職位', '')):
-        await interaction.followup.send("❌ 您非牙材長，權限不足！", ephemeral=True)
+        await safe_followup(interaction, "❌ 您非牙材長，權限不足！", ephemeral=True)
         return
     try:
         dt = datetime.datetime.strptime(截止時間.strip(), "%Y-%m-%d %H:%M")
     except ValueError:
-        await interaction.followup.send(f"❌ 時間格式錯誤！請依照格式輸入：`2026-10-30 23:59`\n（您剛才輸入的是：`{截止時間}`）", ephemeral=True)
+        await safe_followup(interaction, f"❌ 時間格式錯誤！請依照格式輸入：`2026-10-30 23:59`\n（您剛才輸入的是：`{截止時間}`）", ephemeral=True)
         return
 
     now_tw = get_now_tw()
     if dt <= now_tw:
-        await interaction.followup.send(f"❌ 截止時間必須是未來的時間！（目前台灣時間：`{now_tw.strftime('%Y-%m-%d %H:%M')}`）", ephemeral=True)
+        await safe_followup(interaction, f"❌ 截止時間必須是未來的時間！（目前台灣時間：`{now_tw.strftime('%Y-%m-%d %H:%M')}`）", ephemeral=True)
         return
 
     if get_sys_config("PENDING_SETTLEMENT"):
-        await interaction.followup.send("❌ 上一期結算未完成，請執行 /強制關團 重試。", ephemeral=True)
+        await safe_followup(interaction, "❌ 上一期結算未完成，請執行 /強制關團 重試。", ephemeral=True)
         return
     if not await reload_cache():
-        await interaction.followup.send("❌ 資料載入失敗，未開團，請查看 Render Logs。", ephemeral=True)
+        await safe_followup(interaction, "❌ 資料載入失敗，未開團，請查看 Render Logs。", ephemeral=True)
         return
     if get_sys_config("PENDING_SETTLEMENT"):
-        await interaction.followup.send("❌ 上一期結算未完成，請執行 /強制關團。", ephemeral=True)
+        await safe_followup(interaction, "❌ 上一期結算未完成，請執行 /強制關團。", ephemeral=True)
         return
     IS_ORDER_OPEN = False
     ANNOUNCEMENT_CHANNEL_ID = interaction.channel_id
@@ -1024,21 +1059,22 @@ async def start_group_buy(interaction: discord.Interaction, 截止時間: str):
 
     target_role_id = get_sys_config("TARGET_ROLE_ID")
     ping_text = f"<@&{target_role_id}>\n" if target_role_id and target_role_id.strip() else ""
-    await interaction.followup.send("✅ 開團設定完成！正在發佈頻道公告...", ephemeral=True)
+    await safe_followup(interaction, "✅ 開團設定完成！正在發佈頻道公告...", ephemeral=True)
     if interaction.channel:
-        await interaction.channel.send(f"{ping_text}📢 **當期牙材訂購正式開跑！**\n系統將在 `{截止時間.strip()}` 自動截單並清空重置。")
+        await notify_channel(interaction.channel, f"{ping_text}📢 **當期牙材訂購正式開跑！**\n系統將在 `{截止時間.strip()}` 自動截單並清空重置。")
 
 
 @bot.tree.command(name="強制關團", description="【牙材長專用】立即關閉下單通道並產生結算報表")
 async def force_close_order(interaction: discord.Interaction):
     global IS_ORDER_OPEN, ANNOUNCEMENT_CHANNEL_ID
-    await interaction.response.defer(ephemeral=True)
+    if not await safe_defer(interaction):
+        return
     mem = get_member_info(interaction.user.id)
     if not mem or "牙材長" not in str(mem.get('職位', '')):
-        await interaction.followup.send("❌ 您非牙材長，權限不足！", ephemeral=True)
+        await safe_followup(interaction, "❌ 您非牙材長，權限不足！", ephemeral=True)
         return
     if not IS_ORDER_OPEN and not get_sys_config("PENDING_SETTLEMENT"):
-        await interaction.followup.send("❌ 目前沒有正在進行中的團購，不需要關團！", ephemeral=True)
+        await safe_followup(interaction, "❌ 目前沒有正在進行中的團購，不需要關團！", ephemeral=True)
         return
 
     if not ANNOUNCEMENT_CHANNEL_ID:
@@ -1048,7 +1084,7 @@ async def force_close_order(interaction: discord.Interaction):
         if scheduler.get_job(job_id):
             scheduler.remove_job(job_id)
 
-    await interaction.followup.send("✅ 收到強制關團指令！正在背景處理結算報表，請稍候並留意頻道公告...", ephemeral=True)
+    await safe_followup(interaction, "✅ 收到強制關團指令！正在背景處理結算報表，請稍候並留意頻道公告...", ephemeral=True)
     asyncio.create_task(auto_close_order())
 
 
@@ -1058,21 +1094,21 @@ async def modify_deadline(interaction: discord.Interaction, 新截止時間: str
     global IS_ORDER_OPEN, ANNOUNCEMENT_CHANNEL_ID
     mem = get_member_info(interaction.user.id)
     if not mem or "牙材長" not in str(mem.get('職位', '')):
-        await interaction.followup.send("❌ 您非牙材長，權限不足！", ephemeral=True)
+        await safe_followup(interaction, "❌ 您非牙材長，權限不足！", ephemeral=True)
         return
     if not IS_ORDER_OPEN:
-        await interaction.followup.send("❌ 目前沒有正在進行中的團購！", ephemeral=True)
+        await safe_followup(interaction, "❌ 目前沒有正在進行中的團購！", ephemeral=True)
         return
 
     try:
         dt = datetime.datetime.strptime(新截止時間.strip(), "%Y-%m-%d %H:%M")
     except ValueError:
-        await interaction.followup.send("❌ 時間格式錯誤！請依照格式輸入：`2026-10-30 23:59`", ephemeral=True)
+        await safe_followup(interaction, "❌ 時間格式錯誤！請依照格式輸入：`2026-10-30 23:59`", ephemeral=True)
         return
 
     now_tw = get_now_tw()
     if dt <= now_tw:
-        await interaction.followup.send(f"❌ 截止時間必須是未來的時間！（目前台灣時間：`{now_tw.strftime('%Y-%m-%d %H:%M')}`）", ephemeral=True)
+        await safe_followup(interaction, f"❌ 截止時間必須是未來的時間！（目前台灣時間：`{now_tw.strftime('%Y-%m-%d %H:%M')}`）", ephemeral=True)
         return
 
     for job_id in ['close_order_job', 'reminder_job']:
@@ -1085,20 +1121,21 @@ async def modify_deadline(interaction: discord.Interaction, 新截止時間: str
         scheduler.add_job(auto_reminder, 'date', run_date=reminder_time, id='reminder_job', replace_existing=True)
 
     await update_sys_config("CLOSE_TIME", 新截止時間.strip())
-    await interaction.followup.send(f"✅ 成功修改！新的截止時間為 `{新截止時間.strip()}`。", ephemeral=True)
+    await safe_followup(interaction, f"✅ 成功修改！新的截止時間為 `{新截止時間.strip()}`。", ephemeral=True)
 
     channel = bot.get_channel(ANNOUNCEMENT_CHANNEL_ID) if ANNOUNCEMENT_CHANNEL_ID else interaction.channel
     if channel:
         target_role_id = get_sys_config("TARGET_ROLE_ID")
         ping_text = f"<@&{target_role_id}>\n" if target_role_id and target_role_id.strip() else ""
-        await channel.send(f"{ping_text}📢 **【牙材長公告】截單時間已變更！**\n新的截單時間變更至 `{新截止時間.strip()}`，請大家留意！")
+        await notify_channel(channel, f"{ping_text}📢 **【牙材長公告】截單時間已變更！**\n新的截單時間變更至 `{新截止時間.strip()}`，請大家留意！")
 
 
 @bot.tree.command(name="團購進度總覽", description="【全班通用】即時查看當期牙材的湊單進度與數量")
 async def progress_overview(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True)
+    if not await safe_defer(interaction):
+        return
     if not orders_open():
-        await interaction.followup.send("❌ 目前沒有正在進行的團購！", ephemeral=True)
+        await safe_followup(interaction, "❌ 目前沒有正在進行的團購！", ephemeral=True)
         return
 
     products = CACHE["products"]
@@ -1123,19 +1160,20 @@ async def progress_overview(interaction: discord.Interaction):
                 text_content += f"⚠️ **{name}**\n　 └ 湊單中: `{current_total} / {moq}` 個 (還差 {moq - current_total})\n"
 
     embed.description = text_content[:4000] if text_content else "目前尚無商品資料。"
-    await interaction.followup.send(embed=embed, ephemeral=True)
+    await safe_followup(interaction, embed=embed, ephemeral=True)
 
 
 @bot.tree.command(name="訂購牙材", description="挑選當期牙材並進行訂購（可一次勾選多項）")
 async def order_material(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True)
+    if not await safe_defer(interaction):
+        return
     if not orders_open():
-        await interaction.followup.send("❌ 目前非訂購期間，無法進行訂購！", ephemeral=True)
+        await safe_followup(interaction, "❌ 目前非訂購期間，無法進行訂購！", ephemeral=True)
         return
 
     products = CACHE["products"]
     if not products:
-        await interaction.followup.send("❌ 目前商品清單為空，請牙材長確認 Products 表單並執行 `/刷新名冊與商品庫`！", ephemeral=True)
+        await safe_followup(interaction, "❌ 目前商品清單為空，請牙材長確認 Products 表單並執行 `/刷新名冊與商品庫`！", ephemeral=True)
         return
 
     summary = compute_live_product_summary(CACHE["orders"])
@@ -1153,9 +1191,10 @@ async def order_material(interaction: discord.Interaction):
 
 @bot.tree.command(name="我的訂單", description="【個人專用】檢視自己目前的暫存訂單，可修改刪除")
 async def my_orders(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True)
+    if not await safe_defer(interaction):
+        return
     if not orders_open():
-        await interaction.followup.send("🔒 目前非訂購期間，無法查看或修改暫存區！", ephemeral=True)
+        await safe_followup(interaction, "🔒 目前非訂購期間，無法查看或修改暫存區！", ephemeral=True)
         return
 
     all_orders = CACHE["orders"]
@@ -1177,7 +1216,7 @@ async def my_orders(interaction: discord.Interaction):
             total_cost += cost
 
     if not user_orders:
-        await interaction.followup.send("🛒 您目前沒有任何訂購明細喔！", ephemeral=True)
+        await safe_followup(interaction, "🛒 您目前沒有任何訂購明細喔！", ephemeral=True)
         return
 
     embed = discord.Embed(title="🛒 您的當期購物車明細", color=0x2ecc71)
@@ -1193,18 +1232,19 @@ async def my_orders(interaction: discord.Interaction):
 
 @bot.tree.command(name="回報匯款", description="【全班同學】匯款後回報您的帳戶末五碼")
 async def report_payment(interaction: discord.Interaction, 末五碼: str):
-    await interaction.response.defer(ephemeral=True)
+    if not await safe_defer(interaction):
+        return
     if len(末五碼.strip()) != 5 or not 末五碼.strip().isascii() or not 末五碼.strip().isdigit():
-        await interaction.followup.send("❌ 末五碼必須是 5 位數字。", ephemeral=True)
+        await safe_followup(interaction, "❌ 末五碼必須是 5 位數字。", ephemeral=True)
         return
     latest_sheet_name = get_sys_config("LATEST_SETTLEMENT_SHEET")
     if not latest_sheet_name:
-        await interaction.followup.send("❌ 系統設定中找不到最新的結算表，請確認牙材長是否已經產生報表。", ephemeral=True)
+        await safe_followup(interaction, "❌ 系統設定中找不到最新的結算表，請確認牙材長是否已經產生報表。", ephemeral=True)
         return
 
     user_info = get_member_info(interaction.user.id)
     if not user_info:
-        await interaction.followup.send("❌ 找不到您的名冊，請先使用 `/綁定名冊`。", ephemeral=True)
+        await safe_followup(interaction, "❌ 找不到您的名冊，請先使用 `/綁定名冊`。", ephemeral=True)
         return
 
     def _report_sync():
@@ -1234,26 +1274,27 @@ async def report_payment(interaction: discord.Interaction, 末五碼: str):
     try:
         updated = await run_gsheet(_report_sync)
         if updated:
-            await interaction.followup.send(f"✅ 匯款回報成功！已在結算單中登記末五碼 `[{末五碼.strip()}]`，請等待小組長審核。", ephemeral=True)
+            await safe_followup(interaction, f"✅ 匯款回報成功！已在結算單中登記末五碼 `[{末五碼.strip()}]`，請等待小組長審核。", ephemeral=True)
         else:
-            await interaction.followup.send("❌ 找不到您的應繳費紀錄（可能您本期無下單或品項遭淘汰）。", ephemeral=True)
+            await safe_followup(interaction, "❌ 找不到您的應繳費紀錄（可能您本期無下單或品項遭淘汰）。", ephemeral=True)
     except Exception as e:
-        await interaction.followup.send(f"❌ 讀取或寫入結算報表 `[{latest_sheet_name}]` 失敗：{e}", ephemeral=True)
+        await safe_followup(interaction, f"❌ 讀取或寫入結算報表 `[{latest_sheet_name}]` 失敗：{e}", ephemeral=True)
 
 
 @bot.tree.command(name="組內對帳", description="【小組長專用】查看並一鍵確認組內同學繳費（可跨組）")
 @app_commands.describe(指定組別="若代班請填組別數字（可不填，預設為自己組別）")
 async def group_check(interaction: discord.Interaction, 指定組別: int = None):
-    await interaction.response.defer(ephemeral=True)
+    if not await safe_defer(interaction):
+        return
     leader = get_member_info(interaction.user.id)
     if not leader or "小組長" not in str(leader.get('職位', '')):
-        await interaction.followup.send("❌ 您非登記之小組長，權限不足！", ephemeral=True)
+        await safe_followup(interaction, "❌ 您非登記之小組長，權限不足！", ephemeral=True)
         return
 
     target_group = f"第 {指定組別} 組" if 指定組別 is not None else f"第 {leader.get('組別', '')} 組"
     sheet_name = get_sys_config("LATEST_SETTLEMENT_SHEET")
     if not sheet_name:
-        await interaction.followup.send("❌ 找不到當期結算報表設定。", ephemeral=True)
+        await safe_followup(interaction, "❌ 找不到當期結算報表設定。", ephemeral=True)
         return
 
     def _fetch_group_records():
@@ -1263,7 +1304,7 @@ async def group_check(interaction: discord.Interaction, 指定組別: int = None
     try:
         records = await run_gsheet(_fetch_group_records)
     except Exception:
-        await interaction.followup.send(f"❌ 找不到當期結算報表 `[{sheet_name}]`。", ephemeral=True)
+        await safe_followup(interaction, f"❌ 找不到當期結算報表 `[{sheet_name}]`。", ephemeral=True)
         return
 
     embed = discord.Embed(title=f"📋 {target_group} 繳費對帳進度", color=0x9b59b6)
@@ -1297,32 +1338,33 @@ async def group_check(interaction: discord.Interaction, 指定組別: int = None
 
     if not found:
         embed.description = f"本期 {target_group} 無人需繳費，或查無此組資料。"
-        await interaction.followup.send(embed=embed, ephemeral=True)
+        await safe_followup(interaction, embed=embed, ephemeral=True)
     else:
         embed.description = "\n".join(lines)[:4000]
         if pending_members:
             view = GroupConfirmView(pending_members, sheet_name, target_group)
             await send_view(interaction, view, embed=embed)
         else:
-            await interaction.followup.send(embed=embed, ephemeral=True)
+            await safe_followup(interaction, embed=embed, ephemeral=True)
 
 
 @bot.tree.command(name="小組上繳匯款", description="【小組長專用】收齊款項後，向牙材長回報整組上繳之末五碼")
 @app_commands.describe(末五碼="轉帳給牙材長帳戶的末五碼", 指定組別="若代班請填組別數字（預設為自己組別）")
 async def report_group_payment(interaction: discord.Interaction, 末五碼: str, 指定組別: int = None):
-    await interaction.response.defer(ephemeral=True)
+    if not await safe_defer(interaction):
+        return
     if len(末五碼.strip()) != 5 or not 末五碼.strip().isascii() or not 末五碼.strip().isdigit():
-        await interaction.followup.send("❌ 末五碼必須是 5 位數字。", ephemeral=True)
+        await safe_followup(interaction, "❌ 末五碼必須是 5 位數字。", ephemeral=True)
         return
     leader = get_member_info(interaction.user.id)
     if not leader or "小組長" not in str(leader.get('職位', '')):
-        await interaction.followup.send("❌ 權限不足！", ephemeral=True)
+        await safe_followup(interaction, "❌ 權限不足！", ephemeral=True)
         return
 
     target_group = f"第 {指定組別} 組" if 指定組別 is not None else f"第 {leader.get('組別', '')} 組"
     latest_sheet_name = get_sys_config("LATEST_SETTLEMENT_SHEET")
     if not latest_sheet_name:
-        await interaction.followup.send("❌ 找不到最新的結算表。", ephemeral=True)
+        await safe_followup(interaction, "❌ 找不到最新的結算表。", ephemeral=True)
         return
 
     def _report_group_sync():
@@ -1348,24 +1390,25 @@ async def report_group_payment(interaction: discord.Interaction, 末五碼: str,
     try:
         updated = await run_gsheet(_report_group_sync)
         if updated:
-            await interaction.followup.send(f"✅ 成功向牙材長回報！已登記 **{target_group}** 上繳末五碼 `[{末五碼.strip()}]`。", ephemeral=True)
+            await safe_followup(interaction, f"✅ 成功向牙材長回報！已登記 **{target_group}** 上繳末五碼 `[{末五碼.strip()}]`。", ephemeral=True)
         else:
-            await interaction.followup.send(f"❌ 找不到 {target_group} 的應上繳紀錄（可能該組本期無人成團）。", ephemeral=True)
+            await safe_followup(interaction, f"❌ 找不到 {target_group} 的應上繳紀錄（可能該組本期無人成團）。", ephemeral=True)
     except Exception as e:
-        await interaction.followup.send(f"❌ 讀取報表失敗：{e}", ephemeral=True)
+        await safe_followup(interaction, f"❌ 讀取報表失敗：{e}", ephemeral=True)
 
 
 @bot.tree.command(name="全班帳務總覽", description="【牙材長專用】查看並一鍵確認各小組長上繳狀態")
 async def overall_check(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True)
+    if not await safe_defer(interaction):
+        return
     mem = get_member_info(interaction.user.id)
     if not mem or "牙材長" not in str(mem.get('職位', '')):
-        await interaction.followup.send("❌ 您非牙材長，權限不足！", ephemeral=True)
+        await safe_followup(interaction, "❌ 您非牙材長，權限不足！", ephemeral=True)
         return
 
     sheet_name = get_sys_config("LATEST_SETTLEMENT_SHEET")
     if not sheet_name:
-        await interaction.followup.send("❌ 找不到當期結算報表設定。", ephemeral=True)
+        await safe_followup(interaction, "❌ 找不到當期結算報表設定。", ephemeral=True)
         return
 
     def _fetch_overall():
@@ -1375,7 +1418,7 @@ async def overall_check(interaction: discord.Interaction):
     try:
         records = await run_gsheet(_fetch_overall)
     except Exception:
-        await interaction.followup.send(f"❌ 找不到當期結算報表 `[{sheet_name}]`。", ephemeral=True)
+        await safe_followup(interaction, f"❌ 找不到當期結算報表 `[{sheet_name}]`。", ephemeral=True)
         return
 
     embed = discord.Embed(title="👑 全班各組上繳總覽", color=0xf1c40f)
@@ -1406,13 +1449,13 @@ async def overall_check(interaction: discord.Interaction):
 
     if not found:
         embed.description = "本期無任何小組需要上繳帳款。"
-        await interaction.followup.send(embed=embed, ephemeral=True)
+        await safe_followup(interaction, embed=embed, ephemeral=True)
     else:
         if pending_groups:
             view = HeadConfirmView(pending_groups, sheet_name)
             await send_view(interaction, view, embed=embed)
         else:
-            await interaction.followup.send(embed=embed, ephemeral=True)
+            await safe_followup(interaction, embed=embed, ephemeral=True)
 
 
 # ================= 啟動與可觀測的重連 =================
@@ -1443,14 +1486,11 @@ async def main_runner(token: str):
                 return
             except Exception as error:
                 delay = 60
-                if isinstance(error, discord.HTTPException) and error.status == 429:
-                    headers = getattr(getattr(error, "response", None), "headers", {})
-                    try:
-                        delay = max(60, float(headers.get("Retry-After", 900)))
-                    except (TypeError, ValueError):
-                        delay = 900
+                if is_rate_limit(error):
+                    API_HEALTH.fail(error, "login")
+                    delay = retry_seconds(error)
                 BOT_LOGIN_STATUS = f"🟠 連線失敗，{delay:.0f} 秒後重試"
-                logger.exception("Discord connection failed; retry in %.0fs", delay)
+                logger.warning("Discord connection failed type=%s; retry in %.0fs", type(error).__name__, delay)
                 if bot.startup_task and not bot.startup_task.done():
                     bot.startup_task.cancel()
                     await asyncio.gather(bot.startup_task, return_exceptions=True)
