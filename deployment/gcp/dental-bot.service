@@ -1,0 +1,30 @@
+[Unit]
+Description=Dental material Discord bot
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=600
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=dentalbot
+Group=dentalbot
+WorkingDirectory=/etc/dental-bot
+EnvironmentFile=/etc/dental-bot/bot.env
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONPATH=/opt/dental-bot/current
+Environment=PORT=10000
+ExecStartPre=/opt/dental-bot/current/.venv/bin/python /opt/dental-bot/check-config.py
+ExecStart=/opt/dental-bot/current/.venv/bin/python -u -m src.bot
+Restart=on-failure
+RestartSec=60
+TimeoutStopSec=90
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target
