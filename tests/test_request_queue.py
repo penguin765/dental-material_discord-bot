@@ -6,9 +6,9 @@ from unittest.mock import AsyncMock, patch
 import aiohttp
 from aiohttp import web
 import discord
-import discord_api as api
-import bot as app
-import notification_outbox as outbox
+from src import discord_api as api
+from src import bot as app
+from src import notification_outbox as outbox
 from test_bot import Doc
 
 
