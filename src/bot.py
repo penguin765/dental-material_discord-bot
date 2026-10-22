@@ -8,12 +8,11 @@ import asyncio
 import traceback
 import logging
 from functools import wraps
-import urllib.request
 from threading import Thread
 from flask import Flask
 import discord
 from .discord_api import (
-    API_HEALTH, safe_defer, safe_followup, safe_initial_reply, safe_modal,
+    API_HEALTH, safe_defer as api_safe_defer, safe_followup, safe_initial_reply, safe_modal,
     handle_interaction_error, is_rate_limit, retry_seconds, controlled_request,
     http_trace, log_http_metrics, CooldownActive,
 )
@@ -21,12 +20,14 @@ from discord import app_commands
 from discord.ui import View, Select, Modal, TextInput
 import gspread
 from . import notification_outbox as outbox
+from .runtime_metrics import memory_snapshot
 from oauth2client.service_account import ServiceAccountCredentials
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 # ================= 0. 台灣時區與全域設定 =================
 TW_TZ = datetime.timezone(datetime.timedelta(hours=8))
-CMD_SYNC_VERSION = "2026.10.v2"  # 只有當此版本號改變時，啟動才會重新呼叫 tree.sync()
+APP_VERSION = "2026.10.23-lean-0919"
+CMD_SYNC_VERSION = "2026.10.lean-0919"  # 只有當此版本號改變時，啟動才會重新呼叫 tree.sync()
 BOT_LOGIN_STATUS = "🟡 啟動連線中..."
 DATA_READY = False
 SETTLEMENT_LOCK = None
@@ -60,7 +61,8 @@ def home():
         f"📨 互動 API 狀態：{api_status}<br>"
         f"📚 資料狀態：{'就緒' if DATA_READY else '尚未就緒，請查看 Logs'}<br>"
         f"🕒 台灣時間：{now_str}<br>"
-        f"📦 快取狀態：名冊 {len(CACHE['members'])} 人 | 商品 {len(CACHE['products'])} 項 | 暫存訂單 {len(CACHE['orders'])} 筆"
+        f"📦 短期快取：名冊 {len(CACHE['members'])} 人 | 商品 {len(CACHE['products'])} 項 | 訂單按需讀取<br>"
+        f"🏷️ 版本：{APP_VERSION} | RAM：{memory_snapshot()['rss_mb']} MB"
     )
 
 @app.route('/readyz')
@@ -69,7 +71,8 @@ def readiness():
     ready = (bot.is_ready() and DATA_READY and bot.commands_ready
              and api["state"] in ("not_tested", "verified"))
     return {"discord": bot.is_ready(), "data": DATA_READY,
-            "commands": bot.commands_ready, "interaction_api": api}, 200 if ready else 503
+            "commands": bot.commands_ready, "interaction_api": api,
+            "version": APP_VERSION, "memory": memory_snapshot()}, 200 if ready else 503
 
 
 def run_web_server():
@@ -143,13 +146,16 @@ async def run_gsheet(func, *args, **kwargs):
             raise
 
 
-# ─── 全域記憶體快取 (包含 orders 寫入穿透快取，徹底解決讀取卡頓與 API 超額) ───
+# 以 0919 舊版按需讀取架構為基底；只保留短期名冊、商品及必要設定。
 CACHE = {
     "members": [],
     "products": [],
-    "orders": [],
     "sys_config": {}
 }
+
+CATALOG_LOADED_AT = None
+CATALOG_TTL_SECONDS = 60
+CATALOG_LOCK = None
 
 IS_ORDER_OPEN = False
 ANNOUNCEMENT_CHANNEL_ID = None
@@ -158,12 +164,11 @@ scheduler = AsyncIOScheduler(timezone="Asia/Taipei")
 # ================= 3. 輔助函式 (全面快取與非同步版) =================
 
 async def reload_cache():
-    global DATA_READY
-    """在背景執行緒中重新載入所有資料至記憶體，並過濾空白異常列"""
+    global DATA_READY, CATALOG_LOADED_AT
+    """只載入小型參考資料；訂單永不存入全域快取。"""
     def _fetch():
         m = members_sheet.get_all_records(numericise_ignore=["all"])
         raw_p = products_sheet.get_all_records()
-        o = orders_sheet.get_all_records(numericise_ignore=["all"])
         c = sys_sheet.get_all_values()
 
         valid_products = []
@@ -185,21 +190,50 @@ async def reload_cache():
             if len(row) >= 2 and str(row[0]).strip():
                 config_dict[str(row[0]).strip()] = str(row[1]).strip().lstrip("'")
 
-        return m, valid_products, o, config_dict
+        return m, valid_products, config_dict
 
     try:
-        m, p, o, c = await run_gsheet(_fetch)
+        m, p, c = await run_gsheet(_fetch)
         CACHE["members"] = m
         CACHE["products"] = p
-        CACHE["orders"] = o
         CACHE["sys_config"] = c
         DATA_READY = True
-        print(f"✅ 快取更新成功：名冊 {len(m)} 筆、商品 {len(p)} 筆、訂單 {len(o)} 筆。")
+        CATALOG_LOADED_AT = time.monotonic()
+        logger.info("Catalog refreshed members=%s products=%s; orders read on demand", len(m), len(p))
         return True
     except Exception as e:
         DATA_READY = False
         logger.exception("Google Sheets cache load failed")
         return False
+
+
+async def ensure_catalog():
+    """Refresh once on demand after 60s; concurrent commands share the refresh."""
+    global CATALOG_LOCK
+    if CATALOG_LOADED_AT is not None and time.monotonic() - CATALOG_LOADED_AT < CATALOG_TTL_SECONDS:
+        return True
+    if CATALOG_LOCK is None:
+        CATALOG_LOCK = asyncio.Lock()
+    async with CATALOG_LOCK:
+        if CATALOG_LOADED_AT is not None and time.monotonic() - CATALOG_LOADED_AT < CATALOG_TTL_SECONDS:
+            return True
+        return await reload_cache()
+
+
+async def safe_defer(interaction):
+    # Acknowledge before any Sheets/network work so the initial 3s budget is safe.
+    if not await api_safe_defer(interaction):
+        return False
+    if DATA_READY and not await ensure_catalog():
+        await safe_followup(interaction, "❌ 資料讀取失敗，尚未執行操作，請稍後再試。", ephemeral=True)
+        return False
+    return True
+
+
+async def read_orders():
+    """0919-style reads; result belongs only to the current operation."""
+    return await run_gsheet(lambda: orders_sheet.get_all_records(numericise_ignore=["all"]))
+
 
 def get_member_info(user_id):
     """直接從記憶體快取中尋找成員 (0 延遲)"""
@@ -250,10 +284,8 @@ async def update_sys_config(key, value):
     await run_gsheet(_update)
     CACHE["sys_config"][key] = str(value).strip().lstrip("'")
 
-def compute_live_product_summary(all_orders=None):
-    """純記憶體計算湊單數量 (0 API 消耗)"""
-    if all_orders is None:
-        all_orders = CACHE["orders"]
+def compute_live_product_summary(all_orders):
+    """Calculate from this operation's fresh snapshot, without a global order cache."""
     summary = {}
     for o in all_orders:
         item_id = str(o.get('Item_ID', '')).strip()
@@ -266,15 +298,6 @@ def compute_live_product_summary(all_orders=None):
         summary[item_id] = summary.get(item_id, 0) + qty
     return summary
 
-def self_ping_render():
-    """定時自我喚醒，防止 Render 免費方案因 15 分鐘無 HTTP 流量而進入休眠"""
-    url = os.environ.get("RENDER_EXTERNAL_URL")
-    if url:
-        try:
-            urllib.request.urlopen(url, timeout=10)
-        except Exception:
-            pass
-
 # ================= 4. 自動收單、歷史歸檔、重置工作區 =================
 
 async def auto_reminder():
@@ -285,7 +308,7 @@ async def auto_reminder():
         return
 
     products = CACHE["products"]
-    summary = compute_live_product_summary(CACHE["orders"])
+    summary = compute_live_product_summary(await read_orders())
 
     warning_text = ""
     for p in products:
@@ -326,38 +349,60 @@ async def send_dm_task(user_id, embed):
     return await controlled_request('bill_send', lambda: channel.send(embed=embed), background=True)
 
 
-async def drain_outbox():
+def request_outbox_drain(delay=0, attempt=0):
+    if not scheduler.running:
+        return
+    scheduler.add_job(drain_outbox, "date",
+        run_date=datetime.datetime.now(TW_TZ) + datetime.timedelta(seconds=delay),
+        id="invoice_outbox", replace_existing=True, max_instances=1, coalesce=True,
+        kwargs={"attempt": attempt})
+
+
+async def drain_outbox(attempt=0):
     global OUTBOX_LOCK
-    if not DATA_READY or not bot.is_ready() or API_HEALTH.blocked():
+    if not DATA_READY or not bot.is_ready():
+        return  # READY / administrator refresh will trigger recovery.
+    if API_HEALTH.blocked():
+        request_outbox_drain(API_HEALTH.snapshot()["retry_after_seconds"] + 1, attempt)
         return
     if OUTBOX_LOCK is None:
         OUTBOX_LOCK = asyncio.Lock()
     if OUTBOX_LOCK.locked():
         return
     async with OUTBOX_LOCK:
-        records = await run_gsheet(lambda: outbox.pending(doc))
-        for record in records[:5]:  # at most five invoices per 30s tick; bound Sheets writes too
-            if API_HEALTH.blocked() or not bot.is_ready():
-                break
-            key = record['delivery_id']
-            await run_gsheet(lambda: outbox.mark(doc, key, 'sending'))
-            try:
-                result = await send_dm_task(record['user_id'],
-                    discord.Embed.from_dict(json.loads(record['embed_json'])))
-                if result.state == 'success':
-                    status = 'sent'
-                elif result.state in ('cooldown', 'rate_limited'):
-                    status = 'pending'  # rejected / not sent: safe to resume later
-                elif result.state == 'http_error' and 400 <= result.status < 500:
-                    status = 'failed'  # closed DMs or permissions: never loop on 403
+        try:
+            records = await run_gsheet(lambda: outbox.pending(doc, limit=5))
+            for record in records:
+                if API_HEALTH.blocked() or not bot.is_ready():
+                    request_outbox_drain(max(30, API_HEALTH.snapshot()["retry_after_seconds"] + 1))
+                    return
+                key = record["delivery_id"]
+                row_number = record["_row"]
+                await run_gsheet(lambda: outbox.mark(doc, key, "sending", row_number=row_number))
+                result = await send_dm_task(record["user_id"],
+                    discord.Embed.from_dict(json.loads(record["embed_json"])))
+                if result.state == "success":
+                    status = "sent"
+                elif result.state in ("cooldown", "rate_limited"):
+                    status = "pending"
+                elif result.state == "http_error" and 400 <= result.status < 500:
+                    status = "failed"
                 else:
-                    status = 'uncertain'
-                await run_gsheet(lambda: outbox.mark(doc, key, status, result.state))
-                logger.info('Invoice delivery status=%s', status)
-            except Exception as error:
-                # Leave 'sending' durable: next pass marks it uncertain, not sent again.
-                logger.warning('Invoice delivery interrupted error_type=%s', type(error).__name__)
-                break
+                    status = "uncertain"
+                await run_gsheet(lambda: outbox.mark(doc, key, status, result.state, row_number=row_number))
+                logger.info("Invoice delivery status=%s", status)
+                if status == "pending":
+                    request_outbox_drain(max(30, API_HEALTH.snapshot()["retry_after_seconds"] + 1))
+                    return
+            if len(records) == 5:
+                request_outbox_drain(30)  # Only known work causes another batch.
+        except Exception as error:
+            logger.warning("Invoice batch interrupted type=%s attempt=%s; ambiguous sends not replayed",
+                           type(error).__name__, attempt)
+            if attempt < 4:
+                request_outbox_drain(min(300, 30 * 2 ** attempt), attempt + 1)
+            else:
+                logger.error("Invoice recovery paused; administrator must refresh after checking Sheets")
 
 
 async def notify_channel(channel, *args, **kwargs):
@@ -400,7 +445,6 @@ async def _settle_order():
         else:
             all_orders = await run_gsheet(
                 lambda: orders_sheet.get_all_records(numericise_ignore=["all"]))
-        CACHE["orders"] = all_orders
         products = CACHE["products"]
         prod_map = {str(p['Item_ID']).strip(): p for p in products}
         summary = compute_live_product_summary(all_orders)
@@ -537,8 +581,8 @@ async def _settle_order():
         await update_sys_config("IS_ORDER_OPEN", "False")
         await update_sys_config("CLOSE_TIME", "")
         await run_gsheet(lambda: orders_sheet.batch_clear(["A2:G"]))
-        CACHE["orders"] = []
         await update_sys_config("PENDING_SETTLEMENT", "")
+        request_outbox_drain()
 
         if channel:
             await notify_channel(channel,
@@ -607,7 +651,6 @@ class MultiOrderModal(Modal):
             return
 
         rows_to_add = []
-        cache_to_add = []
         reply_msg = "✅ **成功加入暫存訂單！**\n"
         total_cost = 0
 
@@ -629,15 +672,6 @@ class MultiOrderModal(Modal):
             item_id_str = str(p['Item_ID']).strip()
 
             rows_to_add.append([order_id, str(interaction.user.id), mem['姓名'], mem['組別'], item_id_str, qty, subtotal])
-            cache_to_add.append({
-                "Order_ID": order_id,
-                "Discord_User_ID": str(interaction.user.id),
-                "姓名": mem['姓名'],
-                "組別": mem['組別'],
-                "Item_ID": item_id_str,
-                "購買數量": qty,
-                "單項總價": subtotal
-            })
             reply_msg += f"• {p.get('品項名稱')} x {qty} (小計: ${subtotal})\n"
 
         try:
@@ -650,8 +684,6 @@ class MultiOrderModal(Modal):
                 if missing:
                     orders_sheet.append_rows(missing, value_input_option="RAW")
             await run_gsheet(_append)
-            known_ids = {str(o.get("Order_ID", "")) for o in CACHE["orders"]}
-            CACHE["orders"].extend(o for o in cache_to_add if o["Order_ID"] not in known_ids)
             reply_msg += f"\n**本次新增總金額：** NT$ {total_cost:,}\n*(可使用 `/我的訂單` 檢視或修改)*"
             await safe_followup(interaction, reply_msg, ephemeral=True)
         except Exception as e:
@@ -733,7 +765,6 @@ class CancelOrderSelect(Select):
 
         try:
             deleted = await run_gsheet(_delete)
-            CACHE["orders"] = [o for o in CACHE["orders"] if str(o.get("Order_ID", "")).strip() != order_id_to_cancel]
             if deleted:
                 await safe_followup(interaction, "✅ 已成功取消該筆訂單！如需變更數量請重新使用 `/訂購牙材` 下單。", ephemeral=True)
             else:
@@ -891,7 +922,7 @@ class ReadyCommandTree(app_commands.CommandTree):
 
 class DentalERPBot(discord.Client):
     def __init__(self):
-        super().__init__(intents=discord.Intents.default(), http_trace=http_trace())
+        super().__init__(intents=discord.Intents.default(), http_trace=http_trace(), max_messages=None)
         self.tree = ReadyCommandTree(self)
         self._initialized = False
         self.commands_ready = False
@@ -901,10 +932,7 @@ class DentalERPBot(discord.Client):
         logger.info("Discord REST login succeeded; starting scheduler")
         if not scheduler.running:
             scheduler.start()
-            scheduler.add_job(self_ping_render, 'interval', minutes=10,
-                              id='render_keep_alive', replace_existing=True)
-            scheduler.add_job(drain_outbox, 'interval', seconds=30,
-                              id='invoice_outbox', replace_existing=True, max_instances=1, coalesce=True)
+            logger.info("Lean 0919 mode: no idle outbox polling or self-ping")
 
     async def on_ready(self):
         global BOT_LOGIN_STATUS
@@ -952,6 +980,7 @@ class DentalERPBot(discord.Client):
                         await update_sys_config(key, CMD_SYNC_VERSION)
                     self.commands_ready = True
                     logger.info("COMMANDS READY version=%s", CMD_SYNC_VERSION)
+                request_outbox_drain()
                 return
             except Exception as error:
                 delay = 30
@@ -969,7 +998,7 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
     await handle_interaction_error(interaction, error)
 
 
-@bot.tree.command(name="刷新名冊與商品庫", description="【牙材長專用】手動重新從 Google Sheet 載入名冊、商品與訂單快取")
+@bot.tree.command(name="刷新名冊與商品庫", description="【牙材長專用】手動重新載入名冊與商品，恢復待處理帳單通知")
 async def force_reload_cache(interaction: discord.Interaction):
     if not await safe_defer(interaction):
         return
@@ -981,11 +1010,12 @@ async def force_reload_cache(interaction: discord.Interaction):
         return
     ok = await reload_cache()
     if ok:
+        request_outbox_drain()
         await safe_followup(interaction,
             f"✅ 已成功從 Google Sheet 重新載入最新快取！\n"
             f"• 名冊人數：`{len(CACHE['members'])}` 人\n"
             f"• 有效商品：`{len(CACHE['products'])}` 項\n"
-            f"• 暫存訂單：`{len(CACHE['orders'])}` 筆",
+            f"• 訂單按需讀取，不保留完整訂單快取",
             ephemeral=True
         )
     else:
@@ -1179,7 +1209,7 @@ async def progress_overview(interaction: discord.Interaction):
         return
 
     products = CACHE["products"]
-    summary = compute_live_product_summary(CACHE["orders"])
+    summary = compute_live_product_summary(await read_orders())
 
     embed = discord.Embed(title="📊 當期牙材湊單進度總覽", color=0x2ecc71)
     text_content = ""
@@ -1216,7 +1246,7 @@ async def order_material(interaction: discord.Interaction):
         await safe_followup(interaction, "❌ 目前商品清單為空，請牙材長確認 Products 表單並執行 `/刷新名冊與商品庫`！", ephemeral=True)
         return
 
-    summary = compute_live_product_summary(CACHE["orders"])
+    summary = compute_live_product_summary(await read_orders())
 
     chunks = [products[i:i + 25] for i in range(0, min(len(products), 125), 25)]
     view = ExpiringView(timeout=300)
@@ -1237,7 +1267,7 @@ async def my_orders(interaction: discord.Interaction):
         await safe_followup(interaction, "🔒 目前非訂購期間，無法查看或修改暫存區！", ephemeral=True)
         return
 
-    all_orders = CACHE["orders"]
+    all_orders = await read_orders()
     products = CACHE["products"]
     prod_map = {str(p['Item_ID']).strip(): p.get('品項名稱', '未知品項') for p in products}
 
@@ -1505,6 +1535,7 @@ async def connection_watchdog():
         logger.info("Connection status: ready=%s closed=%s data=%s commands=%s",
                     bot.is_ready(), bot.is_closed(), DATA_READY, bot.commands_ready)
         log_http_metrics()
+        logger.info("Runtime memory version=%s stats=%s", APP_VERSION, memory_snapshot())
 
 
 async def main_runner(token: str):
@@ -1514,7 +1545,7 @@ async def main_runner(token: str):
         while True:
             try:
                 BOT_LOGIN_STATUS = "🟡 正在連線至 Discord"
-                logger.info("Starting Discord client")
+                logger.info("Starting Discord client version=%s memory=%s", APP_VERSION, memory_snapshot())
                 await bot.start(token, reconnect=True)
                 return
             except discord.LoginFailure:

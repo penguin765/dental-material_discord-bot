@@ -38,7 +38,7 @@ not_tested 不代表 API 已成功測試。verified 也不能保證下一個請�
 
 ## 背景流量控制與帳單補送（2026-10-16）
 
-背景 HTTP 操作共用單一發送槽，每次完成後至少相隔 0.5 秒；帳單每 30 秒最多處理 5 人，避免 Discord 與 Sheets 同時爆量。slash 初始回覆不等待這個背景槽，仍受互動期限限制。每個 fetch user、create DM、send message 步驟前都重新檢查冷卻，並先使用 Discord 使用者快取。底層 aiohttp trace 也會攔住冷卻期間的內部重試。
+背景 HTTP 操作共用單一發送槽，每次完成後至少相隔 0.5 秒；帳單每批最多處理 5 人，有待處理資料才在 30 秒後繼續；空佇列不輪詢，避免 Discord 與 Sheets 同時爆量。slash 初始回覆不等待這個背景槽，仍受互動期限限制。每個 fetch user、create DM、send message 步驟前都重新檢查冷卻，並先使用 Discord 使用者快取。底層 aiohttp trace 也會攔住冷卻期間的內部重試。
 
 Logs 每 60 秒輸出 `Discord HTTP metrics`：`attempts` 是 aiohttp 實際開始的 HTTP 嘗試（可能尚未送到伺服器）；`status:429` 等為實際收到的回應；`logical:*` 是程式呼叫次數；`suppressed` 是冷卻攔截。這些數字只涵蓋此程序，不涵蓋其他主機或同 IP 的其他服務。操作名稱為固定標籤，不含 token、完整 URL、姓名或帳單內容。
 

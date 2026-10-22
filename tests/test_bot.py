@@ -2,6 +2,8 @@ import asyncio
 import copy
 import json
 import threading
+import time
+import re
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
@@ -20,8 +22,38 @@ class Sheet:
     def get_all_values(self):
         return [[str(value) for value in row] for row in self.rows]
 
-    def update(self, *, values, **kwargs):
-        self.rows = copy.deepcopy(values)
+    def get(self, range_name):
+        start, _, end = range_name.partition(":")
+        end = end or start
+        def position(cell, default):
+            match = re.fullmatch(r"([A-Z]+)([0-9]*)", cell)
+            column = 0
+            for char in match[1]: column = column * 26 + ord(char) - 64
+            return column - 1, int(match[2]) - 1 if match[2] else default
+        left, top = position(start, 0)
+        right, bottom = position(end, len(self.rows) - 1)
+        output = [[str(value) for value in row[left:right+1]] for row in self.rows[top:bottom+1]]
+        while output and not any(output[-1]): output.pop()
+        return output
+
+    def batch_get(self, ranges):
+        return [self.get(name) for name in ranges]
+
+    def append_rows(self, rows, **kwargs):
+        self.rows.extend(copy.deepcopy(rows))
+
+    def update(self, *, values, range_name="A1", **kwargs):
+        if range_name == "A1":
+            self.rows = copy.deepcopy(values)
+            return
+        match = re.fullmatch(r"([A-Z]+)([0-9]+):([A-Z]+)([0-9]+)", range_name)
+        assert match, range_name
+        left, top = ord(match[1]) - 65, int(match[2]) - 1
+        for offset, values_row in enumerate(values):
+            while len(self.rows) <= top + offset: self.rows.append([])
+            row = self.rows[top + offset]
+            row.extend([""] * max(0, left + len(values_row) - len(row)))
+            row[left:left+len(values_row)] = copy.deepcopy(values_row)
 
     def batch_clear(self, ranges):
         assert ranges == ['A2:G']
@@ -85,13 +117,15 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         discord_api.BACKGROUND_NEXT = 0
         app.OUTBOX_LOCK = None
         app.GS_LOCK = None
+        app.CATALOG_LOCK = None
+        app.CATALOG_LOADED_AT = time.monotonic()
         app.SETTLEMENT_LOCK = None
         app.DATA_READY = True
         app.IS_ORDER_OPEN = True
         app.ANNOUNCEMENT_CHANNEL_ID = None
         app.CACHE = {'members': [], 'products': [
             {'Item_ID': 'A', '品項名稱': 'Test', '單價': 10, '最低購買量': 1}],
-            'orders': [], 'sys_config': {'IS_ORDER_OPEN': 'True'}}
+            'sys_config': {'IS_ORDER_OPEN': 'True'}}
         self.doc = Doc()
         self.orders = Sheet([app.ORDER_HEADERS, ['ORD-1', '123', 'Test', '1', 'A', 2, 20]])
         app.doc = self.doc

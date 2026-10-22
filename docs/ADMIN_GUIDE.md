@@ -1,3 +1,5 @@
+> 2026-10-23 精簡測試版：以 0919 舊版流程為基底；訂單按需讀取、名冊商品短期快取、通知按事件處理。詳見 [精簡版說明](LEAN_0919.md)。
+
 # 管理員與部署參考
 
 [返回班級使用指南](../README.md) · [Discord API 限流診斷](DISCORD_API_DIAGNOSTICS.md)
@@ -73,7 +75,7 @@ Discord_User_ID 欄設定為「純文字」後再貼入 ID，以免長整數精�
 - Token rejected：檢查 DISCORD_BOT_TOKEN，使用 Bot token，不是 client secret。
 - 429：依實際 HTTP 狀態與 Retry-After 等待，不因猜測共用 IP 而頻繁重啟。
 - Google Sheets cache load failed：查看 traceback 的權限、JSON 或表頭錯誤；程式每 30 秒重試初始化。
-- 訂單結果尚未確認：不要立刻重複送單。牙材長先刷新快取，再核對 Orders_Temp 的 Order_ID。不同次送出是不同 interaction，不能自動判定是否為重複購買。
+- 訂單結果尚未確認：不要立刻重複送單。牙材長直接核對 Orders_Temp 的 Order_ID（訂單已改為按需讀取）。不同次送出是不同 interaction，不能自動判定是否為重複購買。
 - 結算失敗：保留 PENDING_SETTLEMENT 和所有歷史表，修復連線／資料問題後執行 `/強制關團` 接續。不要手動清空暫存或刪除備份。
 - 若驗證失敗且曾手動編輯半成品報表，先備份、核對原始訂單與報表。程式會停止清理，避免資料遺失。
 - 私訊可能因使用者隱私設定失敗；以結算工作表為帳務依據。
@@ -87,3 +89,4 @@ Discord_User_ID 欄設定為「純文字」後再貼入 ID，以免長整數精�
 測試以記憶體中的 Sheets 替身模擬網路失敗，不使用真實憑證、不發送 Discord 訊息。GitHub Actions 在 Python 3.12 與 3.14 執行相同測試。部署後仍需做上述真實環境驗收。
 
 參考：[discord.py logging](https://discordpy.readthedocs.io/en/latest/logging.html)、[gspread timeout](https://docs.gspread.org/en/latest/api/http_client.html#gspread.HTTPClient.set_timeout)、[Render free limitations](https://render.com/docs/free)。
+
