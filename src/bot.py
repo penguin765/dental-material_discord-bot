@@ -995,6 +995,8 @@ bot = DentalERPBot()
 
 @bot.tree.error
 async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.CheckFailure):
+        return  # interaction_check already replied, or stayed silent on purpose during cooldown
     await handle_interaction_error(interaction, error)
 
 
@@ -1558,12 +1560,19 @@ async def main_runner(token: str):
                 return
             except Exception as error:
                 delay = 60
+                reason = type(error).__name__
                 if is_rate_limit(error):
                     API_HEALTH.fail(error, "login")
                     delay = retry_seconds(error)
+                    reason = API_HEALTH.snapshot()['rate_limit_source']
                 elif isinstance(error, CooldownActive):
                     delay = max(1, API_HEALTH.snapshot()['retry_after_seconds'])
-                BOT_LOGIN_STATUS = f"🟠 連線失敗，{delay:.0f} 秒後重試"
+                    reason = API_HEALTH.snapshot()['rate_limit_source']
+                if reason == 'cloudflare_ip_ban':
+                    BOT_LOGIN_STATUS = (f"🔴 主機 IP 被 Discord/Cloudflare 封鎖 (429/1015)，"
+                                        f"{delay:.0f} 秒後重試；重新部署無效，請換主機或區域")
+                else:
+                    BOT_LOGIN_STATUS = f"🟠 連線失敗 ({reason})，{delay:.0f} 秒後重試"
                 logger.warning("Discord connection failed type=%s; retry in %.0fs", type(error).__name__, delay)
                 if bot.startup_task and not bot.startup_task.done():
                     bot.startup_task.cancel()

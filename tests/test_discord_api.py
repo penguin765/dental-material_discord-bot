@@ -113,6 +113,29 @@ class RateLimitTests(unittest.IsolatedAsyncioTestCase):
             headers = {} if value is None else {'Retry-After': value}
             self.assertEqual(api.retry_seconds(rate_error(headers)), 900)
 
+    def test_classify_429_sources(self):
+        self.assertEqual(api.classify_429({'Retry-After': '60'}), 'cloudflare_ip_ban')
+        self.assertEqual(api.classify_429({'Via': '1.1 google', 'X-RateLimit-Global': 'true'}), 'global')
+        self.assertEqual(api.classify_429({'Via': '1.1 google', 'X-RateLimit-Scope': 'user'}), 'user')
+        self.assertEqual(api.classify_429({'Via': '1.1 google'}), 'route')
+
+    def test_cooldown_is_transient_for_discord_connect_loop(self):
+        import aiohttp
+        self.assertTrue(issubclass(api.CooldownActive, aiohttp.ClientError))
+
+    async def test_route_429_in_trace_does_not_open_global_circuit(self):
+        trace = api.http_trace()
+        end = trace.on_request_end[0]
+        response = SimpleNamespace(status=429, reason='Too Many Requests',
+                                   headers={'Via': '1.1 google', 'X-RateLimit-Scope': 'user',
+                                            'Retry-After': '2'})
+        await end(None, SimpleNamespace(operation='followup'), SimpleNamespace(response=response))
+        self.assertFalse(api.API_HEALTH.blocked())
+        response.headers = {'Retry-After': '60'}  # Cloudflare edge ban: no Via
+        await end(None, SimpleNamespace(operation='login'), SimpleNamespace(response=response))
+        self.assertTrue(api.API_HEALTH.blocked())
+        self.assertEqual(api.API_HEALTH.snapshot()['rate_limit_source'], 'cloudflare_ip_ban')
+
 
 if __name__ == '__main__':
     unittest.main()

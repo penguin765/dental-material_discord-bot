@@ -16,11 +16,23 @@ import discord
 
 logger = logging.getLogger('dental_bot.api')
 SAFE_HEADERS = ('Retry-After', 'X-RateLimit-Scope', 'X-RateLimit-Global',
-                'X-RateLimit-Reset-After', 'CF-Ray', 'Server')
+                'X-RateLimit-Reset-After', 'CF-Ray', 'Server', 'Via')
 
 
 def is_rate_limit(error):
     return isinstance(error, discord.HTTPException) and error.status == 429
+
+
+def classify_429(headers):
+    """Discord's API always sets `Via` on its own 429s; Cloudflare edge bans
+    (error 1015, usually a shared/abused egress IP) do not. discord.py uses the
+    same heuristic before raising instead of retrying."""
+    lower = {str(k).lower(): str(v).lower() for k, v in (headers or {}).items()}
+    if not lower.get('via'):
+        return 'cloudflare_ip_ban'
+    if lower.get('x-ratelimit-global') == 'true' or lower.get('x-ratelimit-scope') == 'global':
+        return 'global'
+    return lower.get('x-ratelimit-scope') or 'route'
 
 
 def retry_seconds(error):
@@ -49,6 +61,7 @@ class APIHealth:
             self.verified = False
             self.failure = None
             self.headers = {}
+            self.source = None
             self.generation = 0
 
     def snapshot(self):
@@ -57,7 +70,8 @@ class APIHealth:
             state = ('cooldown' if remaining else 'awaiting_verification' if self.unresolved
                      else 'verified' if self.verified else 'not_tested')
             return {'state': state, 'retry_after_seconds': remaining,
-                    'last_failure': self.failure, 'rate_limit_headers': dict(self.headers)}
+                    'last_failure': self.failure, 'rate_limit_source': self.source,
+                    'rate_limit_headers': dict(self.headers)}
 
     def blocked(self):
         return self.snapshot()['retry_after_seconds'] > 0
@@ -79,6 +93,7 @@ class APIHealth:
                 for key, value in headers.items()
                 if key.lower() in {name.lower() for name in SAFE_HEADERS}}
         limited = is_rate_limit(error)
+        source = classify_429(headers) if limited else None
         with self.lock:
             self.generation += 1
             self.unresolved = True
@@ -86,16 +101,25 @@ class APIHealth:
             if limited:
                 self.until = max(self.until, self.clock() + retry_seconds(error))
                 self.headers = safe
-        logger.warning('Discord HTTP failure operation=%s status=%s code=%s cooldown=%ss headers=%s',
+                self.source = source
+        logger.warning('Discord HTTP failure operation=%s status=%s code=%s source=%s cooldown=%ss headers=%s',
                        operation, getattr(error, 'status', None), getattr(error, 'code', None),
-                       self.snapshot()['retry_after_seconds'], safe)
+                       source, self.snapshot()['retry_after_seconds'], safe)
+        if source == 'cloudflare_ip_ban':
+            logger.error('Cloudflare blocked this host IP (no Via header). This is an IP-level ban, '
+                         'typically caused by other tenants on a shared egress IP (Render free). '
+                         'Code changes / redeploys cannot lift it; change host or region.')
 
 
 API_HEALTH = APIHealth()
 
 
-class CooldownActive(Exception):
-    """Raised before HTTP I/O; never includes request URLs or credentials."""
+class CooldownActive(aiohttp.ClientConnectionError):
+    """Raised before HTTP I/O; never includes request URLs or credentials.
+
+    Subclasses aiohttp.ClientError so discord.py's Client.connect() treats it as
+    a transient error (backoff + RESUME) instead of crashing bot.start(), which
+    previously forced a full re-login + new IDENTIFY on every overlap."""
 
 
 OPERATION = ContextVar('discord_operation', default='client')
@@ -121,18 +145,27 @@ def http_trace():
     trace = aiohttp.TraceConfig()
 
     async def start(session, context, params):
+        context.operation = OPERATION.get()
+        # Never block the gateway websocket: it is not REST-rate-limited, and
+        # killing it turns a short REST cooldown into a full reconnect+IDENTIFY.
+        if params.url.scheme in ('ws', 'wss'):
+            return
         if API_HEALTH.blocked():
             METRICS['suppressed'] += 1
             raise CooldownActive()
-        context.operation = OPERATION.get()
         METRICS['attempts'] += 1
         METRICS['operation:' + context.operation] += 1
 
     async def end(session, context, params):
         METRICS['status:' + str(params.response.status)] += 1
         if params.response.status == 429:
-            # Headers arrive before discord.py's own retry loop. Open the
-            # circuit now so another coroutine cannot issue the next request.
+            source = classify_429(params.response.headers)
+            METRICS['429:' + source] += 1
+            if source not in ('cloudflare_ip_ban', 'global'):
+                # Per-route/shared bucket: discord.py already sleeps Retry-After
+                # and retries that single route. Opening a process-wide circuit
+                # here made every command silently fail for the cooldown.
+                return
             error = discord.HTTPException(params.response, {'message': 'rate limited'})
             API_HEALTH.fail(error, context.operation)
 
